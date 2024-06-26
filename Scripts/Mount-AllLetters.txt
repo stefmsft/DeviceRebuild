@@ -1,0 +1,15 @@
+select disk 0
+select part 1
+rem === 1. System partition ======================
+assign letter="S"
+select part 3
+rem === 3. Windows partition ======================
+assign letter="W"
+select part 4
+rem === 4. Recovery partition ======================
+assign letter="R"
+select part 5
+rem === 5. MyAsus partition ======================
+assign letter="M"
+list volume
+exit

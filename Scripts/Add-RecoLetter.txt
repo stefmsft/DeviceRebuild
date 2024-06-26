@@ -1,0 +1,6 @@
+select disk 0
+select part 4
+rem === 4. Recovery partition ======================
+assign letter="R"
+list volume
+exit
