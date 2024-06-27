@@ -141,12 +141,14 @@ Finally capture it with a command like :
 Dism /Capture-Image /ImageFile:C:\Temp\PEMakeUSB.wim /CaptureDir:P:\ /Name:PEMakeUSB
 ```
 
+Assuminbg that the PE has been written on a drive named P: with a command "MakeWinPEMedia /UFD"
+
 # creating / Modifying startnet.cmd
 
 To modify startnet.cmd do the following commands
 
 ```Shell
-Dism /Mount-Image /ImageFile:"E:\sources\boot.wim" /index:1 /MountDir:"C:\WinPE_amd64\mount"
+Dism /Mount-Image /ImageFile:"P:\sources\boot.wim" /index:1 /MountDir:"C:\WinPE_amd64\mount"
 # Edit or copy the content from the git repo
 notepad c:\WinPE_amd64\mount\Windows\System32\startnet.cmd
 Dism /Unmount-Image /MountDir:"C:\WinPE_amd64\mount" /commit

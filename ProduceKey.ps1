@@ -188,6 +188,9 @@ exit
     } else {
         Write-Host "FoundLetter is not set to True. Exiting..."
     }
+
+    return $driveLetter
+
 }
 
 function Select-ItemFromList {
@@ -214,17 +217,109 @@ function Select-ItemFromList {
 }
 
 # Function
-function Get-PE {
+function Apply-PE {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$WimFile,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$DriveLetter
+    )
+    
+    # Check if the WIM file exists
+    if (-not (Test-Path -Path $WimFile)) {
+        Write-Host "The specified WIM file does not exist."
+        return
+    }
+    
+    $DestinationRoot = "${DriveLetter}\"
+    
+    # Check if the drive letter is valid
+    if (-not ([System.IO.DriveInfo]::GetDrives().Name -contains $DestinationRoot)) {
+        Write-Host "The specified drive letter is not valid."
+        return
+    }
 
-    Write-Host "Apply PE on the P: Partition"
-
+    # Apply the image from the WIM file to the specified drive letter
+    try {
+        Write-Host "Applying image from $WimFile to drive $DriveLetter..."
+        Dism /Apply-Image /ImageFile:$WimFile /Index:1 /ApplyDir:$DestinationRoot /Verify /NoRpFix
+        Write-Host "Image applied successfully."
+    }
+    catch {
+        Write-Host "An error occurred while applying the image:"
+        Write-Host $_.Exception.Message
+    }
 }
 
 # Function
 function Get-ScriptFiles {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$SourceDirectory,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$DriveLetter
+    )
+    
+    # Ensure the source directory exists
+    if (-not (Test-Path -Path $SourceDirectory)) {
+        Write-Error "The specified source directory does not exist."
+        return
+    }
+    
+    # Ensure the drive letter ends with a colon and backslash
+    $DestinationRoot = "${DriveLetter}\"
 
-    Write-Host "Copy the Script files to $NTFSLetter"
+    # Ensure the drive letter is valid
+    if (-not (Test-Path -Path $DestinationRoot)) {
+        Write-Error "The specified drive letter is not valid."
+        return
+    }
+    
+    # Copy all files from the source directory to the root of the specified drive
+    try {
+        Get-ChildItem -Path $SourceDirectory -File |
+        Copy-Item -Destination $DestinationRoot -Force
+        Write-Host "Files copied successfully to $DestinationRoot"
+    }
+    catch {
+        Write-Error "An error occurred while copying the files: $_"
+    }
+}
 
+function Update-VariableInFile {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$VariableName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$NewValue
+    )
+
+    # Check if the file exists
+    if (-not (Test-Path -Path $FilePath)) {
+        Write-Error "The specified file does not exist."
+        return
+    }
+
+    # Read the file content
+    $fileContent = Get-Content -Path $FilePath
+
+    # Update the variable in the file content
+    $updatedContent = $fileContent | ForEach-Object {
+        if ($_ -match "^\s*$VariableName\s*=") {
+            "$VariableName=$NewValue"
+        } else {
+            $_
+        }
+    }
+
+    # Write the updated content back to the file
+    Set-Content -Path $FilePath -Value $updatedContent
 }
 
 # Function
@@ -241,8 +336,13 @@ function Get-ModelWims {
     }
 
     Write-Host "Model $selectedModel chosen"
-    $sourceDirectory = $DEV_ROOT_WIM + "\\" + $selectedModel
-    $targetDirectory = $NTFSLetter + "\\"
+
+    $sourceDirectory = $DEV_ROOT_WIM + "\" + $selectedModel
+    $targetDirectory = $NTFSLetter + "\"
+
+    $inifile = $targetDirectory + "config.ini"
+    Update-VariableInFile -FilePath $inifile -VariableName "ModelString" -NewValue $selectedModel
+
     # Get all .wim files in the source directory
     $wimFiles = Get-ChildItem -Path $sourceDirectory -Filter "*.wim"
 
@@ -274,6 +374,7 @@ if (-not (Test-IsAdmin)) {
 $configData = Import-PowerShellDataFile -Path ".\config.psd1"
 $PE_WIM = $configData["WinPE_WIM_Location"]
 $DEV_ROOT_WIM = $configData["Device_Root_WIM_Location"]
+$DRIVE_PE = ""
 
 # Check validity of paths
 if ( -not (Test-Path -Path $PE_WIM -PathType Leaf)) {
@@ -291,11 +392,30 @@ Write-Host "Do you want to format a new drive ? Y/N : " -NoNewline -ForegroundCo
 $Response = Read-Host
 # Check for administrative privileges
 if ( $Response -eq "Y") {
-    Format-Drive
-    Get-PE
+    $DRIVE_PE = Format-Drive
+    Apply-PE -WimFile $PE_WIM -DriveLetter $DRIVE_PE
+} else {
+
+    Write-Host "Do you want to Apply the PE content ? Y/N : " -NoNewline -ForegroundColor Yellow
+    $Response = Read-Host
+    if ( $Response -eq "Y") {
+
+        Get-USB
+        $FoundLetter = $False
+        while (-not $FoundLetter) {
+            $Results = Get-DriveLetter
+            $FoundLetter = $Results[0]
+            if ($FoundLetter)
+            {
+                $DRIVE_PE = $Results[2]
+                Apply-PE -WimFile $PE_WIM -DriveLetter $DRIVE_PE
+            }
+        }
+    }        
 }
 
-Write-Host "Please select the destination drive for scripts and WIMs"
+
+Write-Host "Please select the destination drive for scripts" -ForegroundColor Yellow
 
 Get-USB
 $Results = Get-DriveLetter
@@ -303,7 +423,7 @@ $FoundLetter = $Results[0]
 $disk = $Results[1]
 $NTFSLetter = $Results[2]
 
-Get-ScriptFiles
+Get-ScriptFiles -SourceDirectory ".\Scripts" -DriveLetter $NTFSLetter
 
 Write-Host "Do you want also to provide a set of model WIMs on drive $NTFSLetter ? Y/N : " -NoNewline -ForegroundColor Yellow
 $Response = Read-Host
@@ -312,3 +432,4 @@ if ( $Response -eq "Y") {
     Get-ModelWims
 }
 
+Write-Host "Merci d'avoir utilisé ProduceKey ... Fin des programmes" -ForegroundColor Yellow
