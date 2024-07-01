@@ -6,11 +6,16 @@ Automatically rebuild a Windows Device based on a OOBE WIM capture of the model.
 
 # Usage
 
+- After creating the key (see the ProduceKey tool script below) edit the config.ini file at the root and eventually adjust the 2 variables (_ModelString_,_targetScript_) with context values of your futur run.
+  - _ModelString_ should contains the modelname (7 characters)
+  - _targetScript_ should contains the name of the script to launch
+    - _CaptureImage.bat_ to capture the partitions of the device
+    - _ApplyImage.bat_ to apply the WIM files placed at the root of the key (The naming scheme expect to follow _modelname-[OS,PARTTION,RECOVERY,MYASUS].wim_)
 - Plug the USB Key holding the rebuild content in the device.
 - Reboot the device on the key
-	- Reboot + Esc or Reboot + F2 + F8 on Asus devices
-	- Then select the entry representing the first partition of the USB drive
-- Wait for the end of the operation and the reboot of the device.
+	- _Reboot + Esc_ or _Reboot + F2 + F8_ on Asus devices
+	- Then select the entry representing the first partition of the USB drive (WinPE)
+- Wait for the end of the key operation followed by a reboot of the device.
 - If everything works correctly you'll end up in the OOBE for a fresh setup of the device.
 
 >[!Warning] 
@@ -25,25 +30,30 @@ Automatically rebuild a Windows Device based on a OOBE WIM capture of the model.
 - You need to have a WIM file containing a WinPE with a modified startnet.cmd.
 >[!Nota] 
 >The code of startnet.cmd used is in the git repo. refer to the [creating / Modifying startnet.cmd] section for inserting / modifying this code. 
-- You need to prepare the WIM for a model
-	- For that you reset a targeted model device so it boot in OOBE (Thru a "System reset" or by "sysprep /generalize /oobe / reboot")
-	- From here you boot in WinPE and capture de partitions following the naming _ModelName_-PartitionName.WIM (_ModelName_ on 7 Characters, PartitionName part of the following list : OS,SYSTEM,RECOVERY,MYASUS)
+- You need to prepare the WIMs partition for a model
+	- For that you will reset a targeted model device so it boot back in OOBE (Thru a "System reset" or by "sysprep /generalize /oobe / reboot")
+	- From here you boot in WinPE and capture the partitions
+
+>[!Nota] If you capture them manually, follow naming _ModelName_-PartitionName.wim (_ModelName_ on 7 Characters, PartitionName part of the following list : OS,SYSTEM,RECOVERY,MYASUS)
+
 >[!Nota] 
->There's a script (CaptureImage.bat) on the key (in the root directory) that can do the capture automatically for you. For that you need to modify the variable targetScript in config.ini file with the value "CaptureImage.bat". Then you boot on PE and the capture will be done automatically with the correct naming. See [WIM Repo] section for more details
-- You need to sync the git repo containing the tools I produce.
+>There's a script (CaptureImage.bat) on the key (in the root directory) able to capture automatically the partition for you. For that you need to modify the variable _targetScript_ in config.ini file with the value "CaptureImage.bat". Then you boot on PE and the capture will be done automatically with the correct naming.
+
+- You need to sync the git repo containing the tools I produced.
 	- They contain : 
-		- A PowerShell script named ProduceKey.ps1
-        - A variable file container named config.psd1
-		- A Sub-Directory named Scripts containing the script that will be used to wipe the device
+	  - A PowerShell script named ProduceKey.ps1
+      - A variable file container named config.psd1
+      - A Sub-Directory named Scripts containing the script that will be used during the PE operations.
 
 # USB Key Generation
 
-When all the prerequisites are met, and the repo scripts gathered you plug an USB Key in your device.
-Then you edit config.psd1 to reflect where is located the WinPE.WIM file (WinPE_WIM_Location variable) and the root directory holding the model WIMs (Device_Root_WIM_Location)
-The script will abort is the content of those variable is not valid.
+To generate a rebuild Key you start by editing config.psd1 to reflect where is located the WinPE.WIM file (WinPE_WIM_Location variable) and the root directory holding the model WIMs (Device_Root_WIM_Location)
+The script will abort is the content of those variable is not valid but you will be asked wether you wish to generate the PE partition or copy on the key the WIMs of a model previously captured (see below).
+
 Launch the ProduceKey powershell script and follow the questions
 
-Formating the USB key is optionnal. If the option is chosen then the copy of the PE content is automatically done. Otherwise you can choose to skip the operation as well
+Formating the USB key is optionnal. If the option is chosen then the copy of the PE content is automatically done. Otherwise you can choose to skip the operation.
+
 In all case the scripts are refreshed to the key and you are finally asked if you wish the script to copy over the WIMs for a model.
 
 See below for more details
@@ -123,17 +133,17 @@ On the output above there were 2 directory available holding the name B9400CB an
 
 ## Operation
 Create a directory
-Use the CaptureImage.bat script on a prepared device to generate the WIM on the key. Copy those WIMs inside a subdirectory holding the modelname for future deploiement.
+Use the CaptureImage.bat script on a prepared device to generate the WIM on the key. Copy those WIMs inside a subdirectory holding the modelname for future reference on updating/rebuilding the USB Key.
 
 # WinPE WIM
 
-I officially won't provide the WinPE content in my repo.
+I officially won't provide the WinPE WIM content in this repo.
 
-You can use the ADK and follow the plethora of content explain how to produce a WinPE
-This way you can custom it with your language or specific Drivers or Package you wish to add.
+You can use the ADK and follow the plethora of documentation content explaining how to produce a WinPE key.
+This way you can custom it with your language or specifics Drivers or Package you wish to add.
 When its done you need to customize it with the startnet.cmd file provided in the repo.
 
-For that follow the next section.
+For that follow the instruction in the next section.
 
 Finally capture it with a command like :
 
@@ -141,7 +151,7 @@ Finally capture it with a command like :
 Dism /Capture-Image /ImageFile:C:\Temp\PEMakeUSB.wim /CaptureDir:P:\ /Name:PEMakeUSB
 ```
 
-Assuminbg that the PE has been written on a drive named P: with a command "MakeWinPEMedia /UFD"
+Assuminbg that the PE has been previously written on a drive named P: with a command "MakeWinPEMedia /UFD"
 
 # creating / Modifying startnet.cmd
 
