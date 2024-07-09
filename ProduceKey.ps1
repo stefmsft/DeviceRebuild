@@ -160,11 +160,10 @@ function Format-Drive {
 $scriptContent = @"
 select disk $diskNumber
 list disk
-attributes disk clear readonly
 clean
-convert MBR
 create partition primary size=2048
 active
+select partition 1
 format fs=FAT32 quick label="WinPE"
 assign letter=P
 create partition primary
@@ -393,7 +392,7 @@ $Response = Read-Host
 # Check for administrative privileges
 if ( $Response -eq "Y") {
     $DRIVE_PE = Format-Drive
-    Apply-PE -WimFile $PE_WIM -DriveLetter $DRIVE_PE
+    Apply-PE -WimFile $PE_WIM -DriveLetter "P:"
 } else {
 
     Write-Host "Do you want to Apply the PE content ? Y/N : " -NoNewline -ForegroundColor Yellow
@@ -432,4 +431,4 @@ if ( $Response -eq "Y") {
     Get-ModelWims
 }
 
-Write-Host "Merci d'avoir utilisé ProduceKey ... Fin des programmes" -ForegroundColor Yellow
+Write-Host "Merci d'avoir utilise ProduceKey ... Fin des programmes" -ForegroundColor Yellow
