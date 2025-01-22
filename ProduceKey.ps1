@@ -111,25 +111,36 @@ function Get-DriveLetter {
         # If all checks pass, exit the loop
         Write-Host
         Write-Host "The drive letter $driveLetter is valid, not a system drive, and does not exceed 64 GB."
-        $FoundLetter=$True
+        $FoundLetter=$true
         break
     }
 
-    # Get the Win32_DiskDrive associated with the drive letter
-    $disk = Get-WmiObject Win32_DiskDrive -Filter "InterfaceType='USB'" | ForEach-Object {
-        $drive = $_
-        $partitions = Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskDrive.DeviceID='$($drive.DeviceID)'} WHERE AssocClass = Win32_DiskDriveToDiskPartition"
-        
-        foreach ($partition in $partitions) {
-            $logicalDisks = Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} WHERE AssocClass = Win32_LogicalDiskToPartition"
-            foreach ($logicalDisk in $logicalDisks) {
-                if ($logicalDisk.DeviceID -eq $driveLetter) {
-                    return $drive
-                }
+    # Get the logical disk object associated with the drive letter
+    $logicalDisk = Get-WmiObject -Query "SELECT * FROM Win32_LogicalDisk WHERE DeviceID='$driveLetter'"
+
+    if ($null -ne $logicalDisk) {
+        # Get the partition associated with the logical disk
+        $partition = Get-WmiObject -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='$driveLetter'} WHERE AssocClass=Win32_LogicalDiskToPartition"
+
+        if ($null -ne $partition) {
+            # Get the physical disk associated with the partition
+            $diskDrive = Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition"
+
+            if ($null -ne $diskDrive) {
+                # Output the drive number
+                Write-Output "The drive letter $driveLetter corresponds to drive number $($diskDrive.Index)"
+            } else {
+                Write-Output "No physical disk found for partition $($partition.DeviceID)"
             }
+        } else {
+            Write-Output "No partition found for logical disk $driveLetter"
         }
+    } else {
+        Write-Output "No logical disk found for drive letter $driveLetter"
+        exit
     }
-    return $FoundLetter,$disk,$driveLetter
+
+    return $FoundLetter,$diskDrive.Index,$driveLetter
 }
 
 
@@ -139,12 +150,12 @@ function Format-Drive {
     Get-USB
 
     $Results = Get-DriveLetter
-    $FoundLetter = $Results[0]
-    $disk = $Results[1]
-    $driveLetter = $Results[2]
+    $FoundLetter = $Results[1]
+    $diskNumber = $Results[2]
+    $driveLetter = $Results[3]
 
-    if ($disk) {
-        $diskNumber = $disk.Index
+    if ($diskNumber) {
+#        $diskNumber = $disk.Index
         Write-Host "The disk number for drive letter $driveLetter is: $diskNumber"
         # Now you can use $diskNumber in Diskpart
     } else {
@@ -162,7 +173,6 @@ select disk $diskNumber
 list disk
 clean
 create partition primary size=2048
-active
 select partition 1
 format fs=FAT32 quick label="WinPE"
 assign letter=P
@@ -418,9 +428,9 @@ Write-Host "Please select the destination drive for scripts" -ForegroundColor Ye
 
 Get-USB
 $Results = Get-DriveLetter
-$FoundLetter = $Results[0]
-$disk = $Results[1]
-$NTFSLetter = $Results[2]
+$FoundLetter = $Results[1]
+$disk = $Results[2]
+$NTFSLetter = $Results[3]
 
 Get-ScriptFiles -SourceDirectory ".\Scripts" -DriveLetter $NTFSLetter
 
