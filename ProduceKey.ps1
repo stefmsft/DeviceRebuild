@@ -468,6 +468,12 @@ DEPLOYKEY_MARKER=TRUE
             Set-Content -Path $markerFile -Value $markerContent -Force
             Write-Log "Created safety marker on WinPE partition." -Level Success
 
+            # Inject up-to-date startnet.cmd from Scripts\ into boot.wim
+            $startnetOk = Update-StartnetCmd -WinPEDriveLetter $DriveLetter
+            if (-not $startnetOk) {
+                Write-Log "Warning: startnet.cmd could not be updated in boot.wim." -Level Warning
+            }
+
             return $true
         } else {
             Write-Log "DISM failed with exit code: $($process.ExitCode)" -Level Error
@@ -477,6 +483,152 @@ DEPLOYKEY_MARKER=TRUE
     catch {
         Write-Log "Error applying WinPE: $_" -Level Error
         return $false
+    }
+}
+
+function Remove-StaleWimMount {
+    <#
+    .SYNOPSIS
+        Finds and discards any stale DISM mount for a given WIM file.
+        Uses Get-WindowsImage -Mounted (structured, non-localized) instead of
+        parsing DISM text output so it works regardless of Windows language.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$WimFilePath
+    )
+
+    Write-Log "Querying DISM for stale mounts of: $WimFilePath" -Level Warning
+
+    try {
+        $stale = Get-WindowsImage -Mounted -ErrorAction Stop |
+                 Where-Object { $_.ImagePath -ieq $WimFilePath }
+
+        if (-not $stale) {
+            Write-Log "No stale DISM mount found for this WIM." -Level Warning
+            return $false
+        }
+
+        $cleaned = $false
+        foreach ($img in $stale) {
+            Write-Log "Discarding stale mount at: $($img.MountPath)" -Level Warning
+            $p = Start-Process -FilePath "dism.exe" `
+                -ArgumentList "/Unmount-Image /MountDir:`"$($img.MountPath)`" /Discard" `
+                -NoNewWindow -Wait -PassThru
+
+            if ($p.ExitCode -eq 0) {
+                Write-Log "Stale mount discarded." -Level Success
+                $cleaned = $true
+            } else {
+                # Discard can fail if the WIM file was replaced (e.g. USB reformatted).
+                # Still force a Cleanup-Wim so the orphaned record is cleared for the retry.
+                Write-Log "Failed to discard stale mount (exit code: $($p.ExitCode)) - WIM file may have been replaced. Forcing Cleanup-Wim." -Level Warning
+                $cleaned = $true
+            }
+        }
+
+        if ($cleaned) {
+            # Clean up DISM's internal mount metadata to prevent the retry from hanging
+            Write-Log "Running Dism /Cleanup-Wim to clear residual mount metadata..." -Level Info
+            Start-Process -FilePath "dism.exe" -ArgumentList "/Cleanup-Wim" -NoNewWindow -Wait | Out-Null
+            Write-Log "DISM cleanup complete." -Level Info
+        }
+
+        return $cleaned
+    }
+    catch {
+        Write-Log "Error querying mounted images: $_" -Level Error
+        return $false
+    }
+}
+
+function Update-StartnetCmd {
+    <#
+    .SYNOPSIS
+        Injects the current startnet.cmd into the WinPE boot.wim
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$WinPEDriveLetter
+    )
+
+    $bootWim = Join-Path $WinPEDriveLetter "sources\boot.wim"
+    $startnetSource = Join-Path $PSScriptRoot "Scripts\startnet.cmd"
+    $mountDir = "C:\WinPE_Mount"
+
+    if (-not (Test-Path $bootWim)) {
+        Write-Log "boot.wim not found at: $bootWim" -Level Error
+        return $false
+    }
+
+    if (-not (Test-Path $startnetSource)) {
+        Write-Log "startnet.cmd not found at: $startnetSource" -Level Error
+        return $false
+    }
+
+    # Clean up and create mount directory
+    if (Test-Path $mountDir) {
+        Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
+
+    try {
+        # Mount boot.wim
+        Write-Log "Mounting boot.wim to inject startnet.cmd..." -Level Info
+        $process = Start-Process -FilePath "dism.exe" `
+            -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
+            -NoNewWindow -Wait -PassThru
+
+        # 0xC1420127: image already mounted from a previous interrupted session
+        if ($process.ExitCode -eq -1052638937) {
+            Write-Log "boot.wim is already mounted (previous session was interrupted)." -Level Warning
+
+            if (Remove-StaleWimMount -WimFilePath $bootWim) {
+                Write-Log "Retrying mount..." -Level Info
+                # Recreate a clean mount directory after the discard
+                if (Test-Path $mountDir) { Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue }
+                New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
+
+                $process = Start-Process -FilePath "dism.exe" `
+                    -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
+                    -NoNewWindow -Wait -PassThru
+            }
+        }
+
+        if ($process.ExitCode -ne 0) {
+            Write-Log "Failed to mount boot.wim (exit code: $($process.ExitCode))" -Level Error
+            return $false
+        }
+
+        # Copy startnet.cmd into the mounted image
+        $startnetDest = Join-Path $mountDir "Windows\System32\startnet.cmd"
+        Copy-Item -Path $startnetSource -Destination $startnetDest -Force
+        Write-Log "startnet.cmd copied into WinPE image." -Level Success
+
+        # Unmount and commit
+        Write-Log "Committing boot.wim..." -Level Info
+        $process = Start-Process -FilePath "dism.exe" `
+            -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Commit" `
+            -NoNewWindow -Wait -PassThru
+
+        if ($process.ExitCode -ne 0) {
+            Write-Log "Failed to commit boot.wim (exit code: $($process.ExitCode))" -Level Error
+            Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
+            return $false
+        }
+
+        Write-Log "startnet.cmd updated in WinPE successfully." -Level Success
+        return $true
+    }
+    catch {
+        Write-Log "Error updating startnet.cmd: $_" -Level Error
+        Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
+        return $false
+    }
+    finally {
+        if ((Test-Path $mountDir) -and ((Get-ChildItem $mountDir -Force | Measure-Object).Count -eq 0)) {
+            Remove-Item $mountDir -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -510,19 +662,38 @@ function Add-WinPEDrivers {
         return $false
     }
 
-    # Create mount directory
-    if (-not (Test-Path $mountDir)) {
-        New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
+    # Always clean and recreate mount directory — avoids leftover state from a
+    # previous Update-StartnetCmd run or interrupted session
+    if (Test-Path $mountDir) {
+        Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+    New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
 
     try {
         # Mount boot.wim
         Write-Log "Mounting boot.wim..." -Level Info
         Write-Host ""
-        & dism.exe /Mount-Image /ImageFile:"$bootWim" /Index:1 /MountDir:"$mountDir"
+        $process = Start-Process -FilePath "dism.exe" `
+            -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
+            -NoNewWindow -Wait -PassThru
 
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Failed to mount boot.wim (exit code: $LASTEXITCODE)" -Level Error
+        # 0xC1420127: already mounted from a previous interrupted session
+        if ($process.ExitCode -eq -1052638937) {
+            Write-Log "boot.wim is already mounted (previous session was interrupted)." -Level Warning
+
+            if (Remove-StaleWimMount -WimFilePath $bootWim) {
+                Write-Log "Retrying mount..." -Level Info
+                if (Test-Path $mountDir) { Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue }
+                New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
+
+                $process = Start-Process -FilePath "dism.exe" `
+                    -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
+                    -NoNewWindow -Wait -PassThru
+            }
+        }
+
+        if ($process.ExitCode -ne 0) {
+            Write-Log "Failed to mount boot.wim (exit code: $($process.ExitCode))" -Level Error
             return $false
         }
 
@@ -531,12 +702,12 @@ function Add-WinPEDrivers {
         # Inject drivers
         Write-Log "Injecting drivers from: $DriverPath" -Level Info
         Write-Host ""
-        $dismCmd = "dism.exe /Image:`"$mountDir`" /Add-Driver /Driver:`"$DriverPath`" /Recurse"
-        Write-Log "Running: $dismCmd" -Level Info
-        cmd /c $dismCmd
+        $process = Start-Process -FilePath "dism.exe" `
+            -ArgumentList "/Image:`"$mountDir`" /Add-Driver /Driver:`"$DriverPath`" /Recurse" `
+            -NoNewWindow -Wait -PassThru
 
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Warning: Some drivers may have failed to inject (exit code: $LASTEXITCODE)" -Level Warning
+        if ($process.ExitCode -ne 0) {
+            Write-Log "Warning: Some drivers may have failed to inject (exit code: $($process.ExitCode))" -Level Warning
         } else {
             Write-Log "Drivers injected successfully." -Level Success
         }
@@ -544,12 +715,13 @@ function Add-WinPEDrivers {
         # Unmount and commit
         Write-Log "Unmounting and committing changes..." -Level Info
         Write-Host ""
-        cmd /c "dism.exe /Unmount-Image /MountDir:`"$mountDir`" /Commit"
+        $process = Start-Process -FilePath "dism.exe" `
+            -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Commit" `
+            -NoNewWindow -Wait -PassThru
 
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Failed to unmount boot.wim (exit code: $LASTEXITCODE)" -Level Error
-            # Try to discard changes
-            cmd /c "dism.exe /Unmount-Image /MountDir:`"$mountDir`" /Discard"
+        if ($process.ExitCode -ne 0) {
+            Write-Log "Failed to unmount boot.wim (exit code: $($process.ExitCode))" -Level Error
+            Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
             return $false
         }
 
@@ -558,12 +730,10 @@ function Add-WinPEDrivers {
     }
     catch {
         Write-Log "Error injecting drivers: $_" -Level Error
-        # Try to cleanup mount
-        cmd /c "dism.exe /Unmount-Image /MountDir:`"$mountDir`" /Discard" 2>$null
+        Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
         return $false
     }
     finally {
-        # Cleanup mount directory if empty
         if ((Test-Path $mountDir) -and ((Get-ChildItem $mountDir -Force | Measure-Object).Count -eq 0)) {
             Remove-Item $mountDir -Force -ErrorAction SilentlyContinue
         }
@@ -638,7 +808,18 @@ DEPLOYKEY_MARKER=TRUE
 function Copy-ModelWIMs {
     <#
     .SYNOPSIS
-        Copies model-specific WIM files to the USB drive
+        Copies model-specific WIM files (and optional drivers) to the USB drive.
+
+        Source directory structure under WimSourceDirectory:
+          <AnyName>\                  - directory name is used as model string (no model.ini)
+          <AnyName>\model.ini         - overrides model string (ModelString=<value>)
+          <AnyName>\Drivers\          - drivers to inject; copied to I:\Drivers\<ModelString>\
+
+        Display format in the selection list:
+          B9450FA (Pure)                       - no model.ini, no Drivers : dir name = model, factory capture
+          B9450FA (Pure + Drivers)             - no model.ini, Drivers present : dir name = model, vanilla OS
+          EXPERTBOOK_B9450FA_OEM [B9450FA]     - model.ini present, no Drivers : descriptive name, factory capture
+          EXPERTBOOK_B9450FA_PRO [B9450FA] (Drivers) - model.ini present, Drivers present : descriptive name, vanilla OS
     #>
     param(
         [Parameter(Mandatory)]
@@ -656,43 +837,89 @@ function Copy-ModelWIMs {
         return $false
     }
 
-    # Find model directories (typically 6-8 characters, but accept any reasonable length)
-    $modelDirs = Get-ChildItem -Path $WimSourceDirectory -Directory | Where-Object { $_.Name.Length -ge 5 -and $_.Name.Length -le 10 }
+    # Enumerate all subdirectories - no name-length restriction (dirs can be descriptive)
+    $modelDirs = Get-ChildItem -Path $WimSourceDirectory -Directory
 
     if ($modelDirs.Count -eq 0) {
-        Write-Log "No model directories found (expecting 5-10 character folder names)." -Level Warning
+        Write-Log "No directories found in: $WimSourceDirectory" -Level Warning
         return $false
+    }
+
+    # Build enriched list: resolve model name eagerly so it appears in the label
+    $entries = foreach ($dir in $modelDirs) {
+        $hasModelIni = Test-Path (Join-Path $dir.FullName "model.ini")
+        $hasDrivers  = Test-Path (Join-Path $dir.FullName "Drivers") -PathType Container
+
+        # A directory without model.ini must have a name that IS a valid model string
+        # (typically 6-10 characters, no separators). Warn and skip if it looks descriptive.
+        if (-not $hasModelIni -and $dir.Name.Length -gt 10) {
+            Write-Log "Skipping '$($dir.Name)': name is too long for a model string and no model.ini found." -Level Warning
+            continue
+        }
+
+        # Resolve ModelString now so we can embed it in the label
+        $modelString = $dir.Name   # default: directory name IS the model
+        if ($hasModelIni) {
+            $modelIniPath = Join-Path $dir.FullName "model.ini"
+            $modelLine = Get-Content $modelIniPath -ErrorAction SilentlyContinue |
+                         Where-Object { $_ -match '^ModelString=' } |
+                         Select-Object -First 1
+            if ($modelLine) {
+                $parsed = ($modelLine -split '=', 2)[1].Trim()
+                if ($parsed) { $modelString = $parsed }
+            }
+        }
+
+        # Build display label
+        #   No model.ini  -> (Pure) or (Pure + Drivers)   : dir name IS the model string
+        #   Has model.ini -> [RealModel] with optional (Drivers) : descriptive dir name
+        $label = if (-not $hasModelIni) {
+            $tag = if ($hasDrivers) { " (Pure + Drivers)" } else { " (Pure)" }
+            "$($dir.Name)$tag"
+        } else {
+            $tag = if ($hasDrivers) { " (Drivers)" } else { "" }
+            "$($dir.Name) [$modelString]$tag"
+        }
+
+        [PSCustomObject]@{
+            Label       = $label
+            DirName     = $dir.Name
+            Path        = $dir.FullName
+            HasModelIni = $hasModelIni
+            HasDrivers  = $hasDrivers
+            ModelString = $modelString
+        }
     }
 
     Write-Host ""
     Write-Host "  Available Models:" -ForegroundColor Cyan
-    $modelNames = $modelDirs | Select-Object -ExpandProperty Name
+    $selectedLabel = Select-FromList -Items ($entries | Select-Object -ExpandProperty Label) -Prompt "Select model"
+    $selected = $entries | Where-Object { $_.Label -eq $selectedLabel }
 
-    $selectedModel = Select-FromList -Items $modelNames -Prompt "Select model"
+    $modelString = $selected.ModelString
+    Write-Log "Selected: $($selected.DirName)  ->  ModelString: $modelString" -Level Info
 
-    Write-Log "Selected model: $selectedModel" -Level Info
-
-    $sourceDir = Join-Path $WimSourceDirectory $selectedModel
     $destination = "${DriveLetter}\"
 
-    # Update config.ini with model name
+    # Update config.ini with resolved model name
     $configFile = Join-Path $destination "config.ini"
     if (Test-Path $configFile) {
-        Write-Log "Updating config.ini with ModelString=$selectedModel" -Level Info
+        Write-Log "Updating config.ini: ModelString=$modelString" -Level Info
         $content = Get-Content $configFile
-        $content = $content -replace '^ModelString=.*', "ModelString=$selectedModel"
+        $content = $content -replace '^ModelString=.*', "ModelString=$modelString"
         Set-Content -Path $configFile -Value $content
     }
 
-    # Copy WIM and SWM files
-    $wimFiles = Get-ChildItem -Path $sourceDir -Include "*.wim", "*.swm" -Recurse
+    # Copy WIM/SWM files from the directory root only (exclude Drivers\ subfolder)
+    $wimFiles = Get-ChildItem -Path $selected.Path -File |
+                Where-Object { $_.Extension -in @('.wim', '.swm') }
 
     if ($wimFiles.Count -eq 0) {
-        Write-Log "No WIM/SWM files found in $sourceDir" -Level Warning
+        Write-Log "No WIM/SWM files found in $($selected.Path)" -Level Warning
         return $false
     }
 
-    Write-Log "Copying $($wimFiles.Count) WIM/SWM files..." -Level Info
+    Write-Log "Copying $($wimFiles.Count) WIM/SWM file(s)..." -Level Info
 
     $counter = 0
     $totalSize = ($wimFiles | Measure-Object -Property Length -Sum).Sum
@@ -712,7 +939,26 @@ function Copy-ModelWIMs {
     Write-Progress -Activity "Copying WIM Files" -Completed
 
     $totalSizeGB = [math]::Round($totalSize / 1GB, 2)
-    Write-Log "Copied $counter files (${totalSizeGB}GB total)." -Level Success
+    Write-Log "Copied $counter WIM/SWM file(s) (${totalSizeGB}GB total)." -Level Success
+
+    # Copy drivers if present - required when Drivers\ folder exists
+    if ($selected.HasDrivers) {
+        $driverSource = Join-Path $selected.Path "Drivers"
+        $driverDest   = Join-Path $destination "Drivers\$modelString"
+
+        Write-Log "Copying drivers to Drivers\$modelString..." -Level Info
+
+        try {
+            New-Item -Path $driverDest -ItemType Directory -Force | Out-Null
+            Copy-Item -Path "$driverSource\*" -Destination $driverDest -Recurse -Force
+
+            $driverCount = (Get-ChildItem -Path $driverDest -Recurse -File).Count
+            Write-Log "Drivers copied ($driverCount files -> Drivers\$modelString)." -Level Success
+        }
+        catch {
+            Write-Log "Error copying drivers: $_" -Level Warning
+        }
+    }
 
     return $true
 }

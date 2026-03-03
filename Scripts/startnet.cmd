@@ -2,6 +2,9 @@ wpeinit
 
 @echo off
 setlocal enabledelayedexpansion
+set "STARTNET_VERSION=2.0"
+echo   DeviceRebuild Startnet v%STARTNET_VERSION%
+echo.
 
 :: == Setup logging ==
 :: Create timestamp for log file
@@ -51,7 +54,7 @@ if not defined USBDRIVE (
 :: Now we can start logging to USB drive
 set "LOGFILE=%USBDRIVE%\%LOGFILE%"
 call :log "============================================================"
-call :log "  Startnet - WinPE Boot Script"
+call :log "  Startnet - WinPE Boot Script v%STARTNET_VERSION%"
 call :log "  Log file: %LOGFILE%"
 call :log "============================================================"
 call :log ""
@@ -76,11 +79,12 @@ if not defined ModelString (
 
 :: Get the SystemProductName from the registry
 call :log "Reading SystemProductName from registry..."
-for /f "tokens=2*" %%A in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\SystemInformation" /v SystemProductName 2^>nul') do (
-    set "systemProductName=%%B"
+set "systemProductName="
+for /f "tokens=1,2,*" %%A in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\SystemInformation" /v SystemProductName 2^>nul') do (
+    if /i "%%B"=="REG_SZ" set "systemProductName=%%C"
 )
 
-:: Remove any surrounding quotes (if any)
+:: Remove any double quotes from the value (e.g. registry value: "ASUS EXPERTCENTER" P500SV)
 set "systemProductName=%systemProductName:"=%"
 call :log "  SystemProductName: %systemProductName%"
 call :log ""
