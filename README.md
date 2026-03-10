@@ -178,19 +178,6 @@ Log file: `ProduceKey_YYYYMMDD_HHMMSS.log`
 
 # WIM File Naming Convention
 
-Place WIM files in model-specific subdirectories under `Device_Root_WIM_Location`:
-
-```
-DeviceWIMs/
-├── B9450FA/
-│   ├── B9450FA-OS.wim        (or .swm for split images)
-│   ├── B9450FA-OS2.swm       (split WIM parts)
-│   ├── B9450FA-RECOVERY.wim
-│   └── B9450FA-MYASUS.wim
-└── B5402CB/
-    └── ...
-```
-
 **Naming format:** `ModelName-PartitionType.wim`
 
 | Partition Type | Description |
@@ -199,6 +186,90 @@ DeviceWIMs/
 | RECOVERY | Windows Recovery Environment |
 | MYASUS | ASUS vendor partition (optional) |
 | SYSTEM | EFI system partition (rebuilt by bcdboot) |
+
+## Workstation Source Directory Structure
+
+Place model directories under `Device_Root_WIM_Location`. The directory name is used as the model string unless overridden by a `model.ini` file inside it.
+
+**Factory capture layout** (OOBE capture or dirty snapshot):
+```
+Device_Root_WIM_Location/
+├── B9450FA/
+│   ├── B9450FA-OS.wim        (or .swm for split images)
+│   ├── B9450FA-OS2.swm       (split WIM parts, if any)
+│   ├── B9450FA-RECOVERY.wim
+│   └── B9450FA-MYASUS.wim
+└── B5402CB/
+    └── ...
+```
+
+**Vanilla OS + driver injection layout** (Use Case 1):
+```
+Device_Root_WIM_Location/
+└── B9450FA/
+    ├── B9450FA-OS.wim        (renamed from Microsoft install.wim)
+    └── Drivers/              (optional - triggers driver injection)
+        ├── Chipset/
+        │   └── *.inf
+        ├── Graphics/
+        │   └── *.inf
+        ├── Network/
+        │   └── *.inf
+        ├── Audio/
+        │   └── *.inf
+        └── Rapid Storage/    (NVMe/RAID devices - also injected into winre.wim)
+            └── *.inf
+```
+
+> [!NOTE]
+> If the directory name does not match the device's `ModelString`, create a `model.ini` file inside the directory to override it:
+> ```ini
+> ModelString=B9450FA
+> ```
+> This lets you use a descriptive folder name (e.g., `ExpertBook B9`) while keeping the correct model string for deployment.
+
+`ProduceKey.ps1` copies WIM files to the root of `I:\` and the `Drivers\` subfolder to `I:\Drivers\<ModelString>\` automatically.
+
+## USB Key NTFS Partition Structure (I:\\)
+
+This is the layout on the USB storage partition (`I:\`) as seen by `ApplyImage.bat` at boot time. All files must be at the root — this is where `startnet.cmd` changes to before calling the deployment script.
+
+**Vanilla OS + driver injection:**
+```
+I:\                            (USB NTFS storage partition)
+├── config.ini
+├── DEPLOYKEY.marker
+├── ApplyImage.bat
+├── CaptureImage.bat
+├── B9450FA-OS.wim             (or B9450FA-OS.swm + B9450FA-OS2.swm for split)
+└── Drivers\
+    └── B9450FA\               (must match ModelString in config.ini)
+        ├── Chipset\
+        │   └── *.inf
+        ├── Graphics\
+        │   └── *.inf
+        ├── Network\
+        │   └── *.inf
+        ├── Audio\
+        │   └── *.inf
+        └── Rapid Storage\
+            └── *.inf
+```
+
+**Factory image deployment:**
+```
+I:\
+├── config.ini
+├── DEPLOYKEY.marker
+├── ApplyImage.bat
+├── CaptureImage.bat
+├── B9450FA-OS.wim             (or split .swm files)
+├── B9450FA-RECOVERY.wim       (optional)
+└── B9450FA-MYASUS.wim         (optional)
+```
+
+> [!TIP]
+> When manually preparing a USB key without using `ProduceKey.ps1`, copy the scripts from the `Scripts\` folder and the WIM files directly to `I:\` (root), and place drivers under `I:\Drivers\<ModelString>\`.
 
 ## Split WIM Support (SWM)
 

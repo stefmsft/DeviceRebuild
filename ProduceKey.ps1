@@ -662,52 +662,52 @@ function Add-WinPEDrivers {
         return $false
     }
 
-    # Always clean and recreate mount directory — avoids leftover state from a
-    # previous Update-StartnetCmd run or interrupted session
+    # Always clean up stale mounts first — covers re-runs after Ctrl-C
+    Remove-StaleWimMount -WimFilePath $bootWim | Out-Null
+
+    # Clean and recreate mount directory
     if (Test-Path $mountDir) {
         Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
 
     try {
-        # Mount boot.wim
+        # Mount boot.wim — use call operator to avoid Start-Process -Wait hanging
+        # on DismHost.exe child processes that outlive dism.exe itself
         Write-Log "Mounting boot.wim..." -Level Info
         Write-Host ""
-        $process = Start-Process -FilePath "dism.exe" `
-            -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
-            -NoNewWindow -Wait -PassThru
+        & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
+        $dismExitCode = $LASTEXITCODE
 
-        # 0xC1420127: already mounted from a previous interrupted session
-        if ($process.ExitCode -eq -1052638937) {
-            Write-Log "boot.wim is already mounted (previous session was interrupted)." -Level Warning
-
+        if ($dismExitCode -ne 0) {
+            # Fallback stale-mount recovery (e.g. drive letter changed between sessions)
+            Write-Log "Mount failed (exit code: $dismExitCode) — attempting stale mount recovery..." -Level Warning
             if (Remove-StaleWimMount -WimFilePath $bootWim) {
                 Write-Log "Retrying mount..." -Level Info
                 if (Test-Path $mountDir) { Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue }
                 New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
-
-                $process = Start-Process -FilePath "dism.exe" `
-                    -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
-                    -NoNewWindow -Wait -PassThru
+                Write-Host ""
+                & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
+                $dismExitCode = $LASTEXITCODE
             }
         }
 
-        if ($process.ExitCode -ne 0) {
-            Write-Log "Failed to mount boot.wim (exit code: $($process.ExitCode))" -Level Error
+        if ($dismExitCode -ne 0) {
+            Write-Log "Failed to mount boot.wim (exit code: $dismExitCode)" -Level Error
             return $false
         }
 
         Write-Log "boot.wim mounted successfully." -Level Success
 
-        # Inject drivers
+        # Inject drivers — RST/storage drivers can take several minutes, this is normal
         Write-Log "Injecting drivers from: $DriverPath" -Level Info
+        Write-Log "(Driver injection may take several minutes — please wait)" -Level Warning
         Write-Host ""
-        $process = Start-Process -FilePath "dism.exe" `
-            -ArgumentList "/Image:`"$mountDir`" /Add-Driver /Driver:`"$DriverPath`" /Recurse" `
-            -NoNewWindow -Wait -PassThru
+        & dism.exe /Image:"$mountDir" /Add-Driver "/Driver:$DriverPath" /Recurse
+        $dismExitCode = $LASTEXITCODE
 
-        if ($process.ExitCode -ne 0) {
-            Write-Log "Warning: Some drivers may have failed to inject (exit code: $($process.ExitCode))" -Level Warning
+        if ($dismExitCode -ne 0) {
+            Write-Log "Warning: Some drivers may have failed to inject (exit code: $dismExitCode)" -Level Warning
         } else {
             Write-Log "Drivers injected successfully." -Level Success
         }
@@ -715,13 +715,12 @@ function Add-WinPEDrivers {
         # Unmount and commit
         Write-Log "Unmounting and committing changes..." -Level Info
         Write-Host ""
-        $process = Start-Process -FilePath "dism.exe" `
-            -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Commit" `
-            -NoNewWindow -Wait -PassThru
+        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Commit
+        $dismExitCode = $LASTEXITCODE
 
-        if ($process.ExitCode -ne 0) {
-            Write-Log "Failed to unmount boot.wim (exit code: $($process.ExitCode))" -Level Error
-            Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
+        if ($dismExitCode -ne 0) {
+            Write-Log "Failed to unmount boot.wim (exit code: $dismExitCode)" -Level Error
+            & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
             return $false
         }
 
@@ -730,7 +729,7 @@ function Add-WinPEDrivers {
     }
     catch {
         Write-Log "Error injecting drivers: $_" -Level Error
-        Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
+        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
         return $false
     }
     finally {
@@ -802,6 +801,86 @@ DEPLOYKEY_MARKER=TRUE
     catch {
         Write-Log "Error copying scripts: $_" -Level Error
         return $false
+    }
+}
+
+function Find-RSTDriverPath {
+    <#
+    .SYNOPSIS
+        Returns the RST/storage driver subfolder within a driver directory,
+        or $null if none is found.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriverDir
+    )
+
+    $rst = Join-Path $DriverDir "Rapid Storage"
+    if (Test-Path $rst -PathType Container) { return $rst }
+
+    $alt = Get-ChildItem -Path $DriverDir -Directory -Recurse -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -match 'Storage|RST|IRST' } |
+           Select-Object -First 1
+
+    return if ($alt) { $alt.FullName } else { $null }
+}
+
+function Copy-FileWithProgress {
+    <#
+    .SYNOPSIS
+        Copies a single file with byte-level progress reporting.
+        Designed for large WIM files where Copy-Item gives no feedback.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Source,
+
+        [Parameter(Mandatory)]
+        [string]$Destination,
+
+        # Total bytes in the batch (for overall % across multiple files)
+        [long]$TotalBatchBytes = 0,
+
+        # Bytes already copied before this file
+        [long]$BytesBefore = 0
+    )
+
+    $fileName  = Split-Path $Source -Leaf
+    $fileBytes = (Get-Item $Source).Length
+    $destPath  = if (Test-Path $Destination -PathType Container) {
+                     Join-Path $Destination $fileName
+                 } else { $Destination }
+
+    $bufferSize = 4194304  # 4 MB
+    $buffer     = New-Object byte[] $bufferSize
+
+    $src = [System.IO.File]::OpenRead($Source)
+    $dst = [System.IO.File]::Open($destPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+
+    try {
+        $copied = 0L
+        while ($true) {
+            $read = $src.Read($buffer, 0, $bufferSize)
+            if ($read -eq 0) { break }
+            $dst.Write($buffer, 0, $read)
+            $copied += $read
+
+            $fileMB    = [math]::Round($copied   / 1MB, 0)
+            $fileTotMB = [math]::Round($fileBytes / 1MB, 0)
+            $pct = if ($TotalBatchBytes -gt 0) {
+                       [math]::Round(($BytesBefore + $copied) / $TotalBatchBytes * 100, 0)
+                   } else {
+                       [math]::Round($copied / $fileBytes * 100, 0)
+                   }
+
+            Write-Progress -Activity "Copying WIM Files" `
+                           -Status "${fileName}  ${fileMB} / ${fileTotMB} MB" `
+                           -PercentComplete $pct
+        }
+    }
+    finally {
+        $src.Close()
+        $dst.Close()
     }
 }
 
@@ -901,12 +980,50 @@ function Copy-ModelWIMs {
 
     $destination = "${DriveLetter}\"
 
-    # Update config.ini with resolved model name
+    # Update config.ini with resolved model name and auto-detected edition index
     $configFile = Join-Path $destination "config.ini"
     if (Test-Path $configFile) {
-        Write-Log "Updating config.ini: ModelString=$modelString" -Level Info
         $content = Get-Content $configFile
+
+        # Always update ModelString
         $content = $content -replace '^ModelString=.*', "ModelString=$modelString"
+        Write-Log "Updating config.ini: ModelString=$modelString" -Level Info
+
+        # Auto-detect Pro edition index from the OS WIM (source, before copy)
+        $osWimSource = Get-ChildItem -Path $selected.Path -File |
+                       Where-Object { $_.Name -match '^.*-OS\.wim$' -or $_.Name -match '^.*-OS\.swm$' } |
+                       Select-Object -First 1
+
+        if ($osWimSource) {
+            try {
+                $images = Get-WindowsImage -ImagePath $osWimSource.FullName -ErrorAction Stop
+                $proImage = $images | Where-Object { $_.ImageName -match '\bPro\b' } | Select-Object -First 1
+
+                if ($proImage) {
+                    $detectedIndex = $proImage.ImageIndex
+                    Write-Log "Detected Pro edition: '$($proImage.ImageName)' at index $detectedIndex" -Level Success
+
+                    if ($content -match '^EditionIndex=') {
+                        $content = $content -replace '^EditionIndex=.*', "EditionIndex=$detectedIndex"
+                    } else {
+                        $content += "`nEditionIndex=$detectedIndex"
+                    }
+                    Write-Log "Updating config.ini: EditionIndex=$detectedIndex" -Level Info
+                } elseif ($images.Count -eq 1) {
+                    Write-Log "Single-edition WIM ($($images[0].ImageName)) — EditionIndex left as-is." -Level Info
+                } else {
+                    Write-Log "No Pro edition found in WIM ($($images.Count) editions present) — EditionIndex left as-is." -Level Warning
+                    Write-Log "Available editions: $(($images | Select-Object -ExpandProperty ImageName) -join ', ')" -Level Warning
+                }
+            }
+            catch {
+                Write-Log "Could not read WIM image info: $_" -Level Warning
+                Write-Log "EditionIndex left as-is in config.ini." -Level Warning
+            }
+        } else {
+            Write-Log "No OS WIM found in source — EditionIndex left as-is." -Level Warning
+        }
+
         Set-Content -Path $configFile -Value $content
     }
 
@@ -919,27 +1036,21 @@ function Copy-ModelWIMs {
         return $false
     }
 
-    Write-Log "Copying $($wimFiles.Count) WIM/SWM file(s)..." -Level Info
+    $totalSizeBytes = ($wimFiles | Measure-Object -Property Length -Sum).Sum
+    $totalSizeMB    = [math]::Round($totalSizeBytes / 1MB, 0)
+    Write-Log "Copying $($wimFiles.Count) WIM/SWM file(s) (${totalSizeMB} MB total)..." -Level Info
 
-    $counter = 0
-    $totalSize = ($wimFiles | Measure-Object -Property Length -Sum).Sum
-    $copiedSize = 0
-
+    $copiedBytes = 0L
     foreach ($file in $wimFiles) {
-        $counter++
-        $percentComplete = [math]::Round(($copiedSize / $totalSize) * 100, 0)
-        $sizeMB = [math]::Round($file.Length / 1MB, 0)
-
-        Write-Progress -Activity "Copying WIM Files" -Status "$($file.Name) (${sizeMB}MB)" -PercentComplete $percentComplete
-
-        Copy-Item -Path $file.FullName -Destination $destination -Force
-        $copiedSize += $file.Length
+        Copy-FileWithProgress -Source $file.FullName -Destination $destination `
+                              -TotalBatchBytes $totalSizeBytes -BytesBefore $copiedBytes
+        $copiedBytes += $file.Length
     }
 
     Write-Progress -Activity "Copying WIM Files" -Completed
 
-    $totalSizeGB = [math]::Round($totalSize / 1GB, 2)
-    Write-Log "Copied $counter WIM/SWM file(s) (${totalSizeGB}GB total)." -Level Success
+    $totalSizeGB = [math]::Round($totalSizeBytes / 1GB, 2)
+    Write-Log "Copied $($wimFiles.Count) WIM/SWM file(s) (${totalSizeGB} GB total)." -Level Success
 
     # Copy drivers if present - required when Drivers\ folder exists
     if ($selected.HasDrivers) {
@@ -1043,89 +1154,9 @@ if (Read-YesNo "Do you want to format a USB drive?") {
 }
 
 # ============================================================
-# Step 3: Inject Drivers into WinPE (Optional)
+# Step 3: Copy Script Files (Optional)
 # ============================================================
-Write-Section "Step 3: Inject Drivers into WinPE (Optional)"
-
-Write-Host ""
-Write-Log "You can inject storage drivers (e.g., Intel RST) to enable disk detection in WinPE." -Level Info
-Write-Host ""
-
-if (Read-YesNo "Do you want to inject drivers into WinPE boot.wim?") {
-    # If WinPE drive not already set, ask user to select it
-    if (-not $winPEDrive) {
-        Write-Host ""
-        Write-Log "Select the WinPE partition (FAT32 partition with sources\boot.wim):" -Level Info
-        $selectedPE = Select-DriveLetter -Purpose "WinPE partition"
-        if ($selectedPE) {
-            $winPEDrive = $selectedPE.DriveLetter
-        }
-    }
-
-    if ($winPEDrive) {
-        # Verify boot.wim exists
-        $bootWimPath = Join-Path $winPEDrive "sources\boot.wim"
-        if (-not (Test-Path $bootWimPath)) {
-            Write-Log "boot.wim not found at $bootWimPath - is this the correct WinPE partition?" -Level Error
-        } else {
-            # Ask for Images drive letter to find drivers
-            Write-Host ""
-            $imagesLetter = Read-KeyPress "Enter the Images drive letter (e.g., I): "
-
-            if ($imagesLetter) {
-                $imagesDriveLetter = "${imagesLetter}:"
-                $driversRoot = Join-Path $imagesDriveLetter "Drivers"
-
-                if (-not (Test-Path $driversRoot -PathType Container)) {
-                    Write-Log "Drivers folder not found at $driversRoot" -Level Error
-                } else {
-                    # Get first model directory under Drivers
-                    $modelDir = Get-ChildItem -Path $driversRoot -Directory | Select-Object -First 1
-
-                    if (-not $modelDir) {
-                        Write-Log "No model directory found under $driversRoot" -Level Error
-                    } else {
-                        # Look for Rapid Storage directory
-                        $rstPath = Join-Path $modelDir.FullName "Rapid Storage"
-
-                        if (-not (Test-Path $rstPath -PathType Container)) {
-                            Write-Log "Rapid Storage folder not found at $rstPath" -Level Error
-                            Write-Log "Looking for alternative storage driver folders..." -Level Info
-
-                            # Try to find any folder with "Storage" or "RST" in name
-                            $altDriver = Get-ChildItem -Path $modelDir.FullName -Directory -Recurse |
-                                Where-Object { $_.Name -match 'Storage|RST|IRST' } |
-                                Select-Object -First 1
-
-                            if ($altDriver) {
-                                $rstPath = $altDriver.FullName
-                                Write-Log "Found alternative: $rstPath" -Level Info
-                            } else {
-                                Write-Log "No storage driver folder found." -Level Error
-                                $rstPath = $null
-                            }
-                        }
-
-                        if ($rstPath) {
-                            Write-Log "Using driver path: $rstPath" -Level Info
-                            Write-Log "Model: $($modelDir.Name)" -Level Info
-                            Add-WinPEDrivers -WinPEDriveLetter $winPEDrive -DriverPath $rstPath
-                        }
-                    }
-                }
-            } else {
-                Write-Log "No drive letter provided. Skipping." -Level Warning
-            }
-        }
-    } else {
-        Write-Log "No WinPE partition selected. Skipping." -Level Warning
-    }
-}
-
-# ============================================================
-# Step 4: Copy Script Files (Optional)
-# ============================================================
-Write-Section "Step 4: Copy Script Files (Optional)"
+Write-Section "Step 3: Copy Script Files (Optional)"
 
 if (Read-YesNo "Do you want to copy deployment scripts to USB?") {
     Write-Host ""
@@ -1142,11 +1173,11 @@ if (Read-YesNo "Do you want to copy deployment scripts to USB?") {
 }
 
 # ============================================================
-# Step 5: Copy Model WIMs (Optional)
+# Step 4: Copy Model WIMs (Optional)
 # ============================================================
-Write-Section "Step 5: Copy Model WIMs (Optional)"
+Write-Section "Step 4: Copy Model WIMs (Optional)"
 
-if ($imagesDrive -and (Read-YesNo "Do you want to copy model WIM files to $imagesDrive ?")) {
+if ($imagesDrive -and (Read-YesNo "Do you want to copy model WIM files to ${imagesDrive}?")) {
 
     # Validate Device WIM root only when needed
     if (-not (Test-Path -Path $DEV_ROOT_WIM -PathType Container)) {
@@ -1154,6 +1185,91 @@ if ($imagesDrive -and (Read-YesNo "Do you want to copy model WIM files to $image
         Write-Log "Please update Device_Root_WIM_Location in config.psd1" -Level Warning
     } else {
         Copy-ModelWIMs -DriveLetter $imagesDrive -WimSourceDirectory $DEV_ROOT_WIM
+    }
+}
+
+# ============================================================
+# Step 5: Inject Drivers into WinPE (Optional)
+# ============================================================
+Write-Section "Step 5: Inject Drivers into WinPE (Optional)"
+
+Write-Host ""
+Write-Log "Inject storage drivers (e.g., Intel RST) into WinPE to enable disk detection." -Level Info
+Write-Host ""
+
+if (Read-YesNo "Do you want to inject drivers into WinPE boot.wim?") {
+
+    # Get WinPE partition if not already known
+    if (-not $winPEDrive) {
+        Write-Host ""
+        Write-Log "Select the WinPE partition (FAT32 partition with sources\boot.wim):" -Level Info
+        $selectedPE = Select-DriveLetter -Purpose "WinPE partition"
+        if ($selectedPE) { $winPEDrive = $selectedPE.DriveLetter }
+    }
+
+    if (-not $winPEDrive) {
+        Write-Log "No WinPE partition selected. Skipping." -Level Warning
+    } else {
+        $bootWimPath = Join-Path $winPEDrive "sources\boot.wim"
+        if (-not (Test-Path $bootWimPath)) {
+            Write-Log "boot.wim not found at $bootWimPath - is this the correct WinPE partition?" -Level Error
+        } else {
+
+            # --- Discover RST driver sources ---
+            $rstEntries = @()
+
+            # 1. Check drivers already on the images drive (copied by Step 4)
+            if ($imagesDrive) {
+                $driversRoot = Join-Path $imagesDrive "Drivers"
+                if (Test-Path $driversRoot -PathType Container) {
+                    foreach ($modelDir in (Get-ChildItem $driversRoot -Directory)) {
+                        $rst = Find-RSTDriverPath -DriverDir $modelDir.FullName
+                        if ($rst) {
+                            $rstEntries += [PSCustomObject]@{
+                                Label = "$($modelDir.Name)  [on key: $imagesDrive]"
+                                Path  = $rst
+                            }
+                        }
+                    }
+                }
+            }
+
+            # 2. Nothing on the key — scan the WIM repository for models with Drivers\
+            if ($rstEntries.Count -eq 0) {
+                if (Test-Path $DEV_ROOT_WIM -PathType Container) {
+                    Write-Log "No drivers found on key — scanning WIM repository for driver sources..." -Level Info
+                    foreach ($dir in (Get-ChildItem $DEV_ROOT_WIM -Directory)) {
+                        $srcDriverDir = Join-Path $dir.FullName "Drivers"
+                        if (Test-Path $srcDriverDir -PathType Container) {
+                            $rst = Find-RSTDriverPath -DriverDir $srcDriverDir
+                            if ($rst) {
+                                $rstEntries += [PSCustomObject]@{
+                                    Label = "$($dir.Name)  [from repository]"
+                                    Path  = $rst
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ($rstEntries.Count -eq 0) {
+                Write-Log "No RST/storage driver sources found. Skipping." -Level Warning
+                Write-Log "Expected structure: <Images>:\Drivers\<Model>\Rapid Storage\  or  <WIM repo>\<Model>\Drivers\Rapid Storage\" -Level Warning
+            } else {
+                # Always go through the list so the user can confirm before injecting
+                Write-Host ""
+                Write-Log "$(if ($rstEntries.Count -eq 1) { 'Driver source found' } else { 'Multiple driver sources found' }) — select one to inject:" -Level Info
+                $selectedLabel = Select-FromList -Items ($rstEntries | Select-Object -ExpandProperty Label) `
+                                                -Prompt "Select driver source"
+                $selectedEntry = $rstEntries | Where-Object { $_.Label -eq $selectedLabel }
+
+                if ($selectedEntry) {
+                    Write-Log "Using driver path: $($selectedEntry.Path)" -Level Info
+                    Add-WinPEDrivers -WinPEDriveLetter $winPEDrive -DriverPath $selectedEntry.Path
+                }
+            }
+        }
     }
 }
 

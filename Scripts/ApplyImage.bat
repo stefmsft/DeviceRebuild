@@ -50,7 +50,11 @@ if "%DiskNumber%"=="" (
     exit /b 1
 )
 
+rem Default EditionIndex to 1 if not set in config.ini
+if not defined EditionIndex set "EditionIndex=1"
+
 call :log "      Target DiskNumber=%DiskNumber%"
+call :log "      EditionIndex=%EditionIndex%"
 
 rem ============================================================
 rem == SAFETY CHECK: Prevent formatting the USB key
@@ -176,10 +180,10 @@ call :log "[4/12] Applying OS image to W:\..."
 rem Check for split WIM files first (SWM takes priority)
 if exist "%MODEL%-OS.swm" (
     call :log "      Detected split WIM files (SWM), applying with /SWMFile..."
-    dism /Apply-Image /ImageFile:"%MODEL%-OS.swm" /SWMFile:"%MODEL%-OS*.swm" /Index:1 /ApplyDir:W:\ >> "%LOGFILE%" 2>&1
+    dism /Apply-Image /ImageFile:"%MODEL%-OS.swm" /SWMFile:"%MODEL%-OS*.swm" /Index:%EditionIndex% /ApplyDir:W:\ >> "%LOGFILE%" 2>&1
 ) else if exist "%MODEL%-OS.wim" (
     call :log "      Applying standard WIM file..."
-    dism /Apply-Image /ImageFile:"%MODEL%-OS.wim" /Index:1 /ApplyDir:W:\ >> "%LOGFILE%" 2>&1
+    dism /Apply-Image /ImageFile:"%MODEL%-OS.wim" /Index:%EditionIndex% /ApplyDir:W:\ >> "%LOGFILE%" 2>&1
 ) else (
     call :log "ERROR: No OS image found. Expected %MODEL%-OS.swm or %MODEL%-OS.wim"
     exit /b 1
