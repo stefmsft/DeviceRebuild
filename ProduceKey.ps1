@@ -11,224 +11,30 @@
     Enable logging to file. By default, no log file is created.
 
 .NOTES
-    Requires: Administrator privileges, Windows ADK
+    Requires: Administrator privileges
 #>
 param(
     [switch]$Log
 )
 
 # ============================================================
+# Module Import
+# ============================================================
+Import-Module (Join-Path $PSScriptRoot "DeviceRebuild.psm1") -Force
+
+# ============================================================
 # Configuration
 # ============================================================
-$Script:SizeLimit = 128GB  # Maximum drive size to allow formatting
+$Script:SizeLimit  = 128GB
 $Script:LogEnabled = $Log.IsPresent
-$Script:LogFile = if ($Script:LogEnabled) { "ProduceKey_$(Get-Date -Format 'yyyyMMdd_HHmmss').log" } else { $null }
+$Script:LogFile    = if ($Script:LogEnabled) { "ProduceKey_$(Get-Date -Format 'yyyyMMdd_HHmmss').log" } else { $null }
+
+Initialize-Logging -Enabled $Script:LogEnabled -LogFile $Script:LogFile
 
 # ============================================================
-# Logging Functions
+# Core Operations
 # ============================================================
-function Write-Log {
-    param(
-        [string]$Message,
-        [ValidateSet('Info', 'Warning', 'Error', 'Success')]
-        [string]$Level = 'Info'
-    )
-
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $logMessage = "[$timestamp] [$Level] $Message"
-
-    # Write to log file (if enabled)
-    if ($Script:LogEnabled) {
-        Add-Content -Path $Script:LogFile -Value $logMessage
-    }
-
-    # Write to console with color
-    switch ($Level) {
-        'Info'    { Write-Host $Message }
-        'Warning' { Write-Host $Message -ForegroundColor Yellow }
-        'Error'   { Write-Host $Message -ForegroundColor Red }
-        'Success' { Write-Host $Message -ForegroundColor Green }
-    }
-}
-
-function Write-Banner {
-    param([string]$Title)
-
-    $line = "=" * 60
-    Write-Host ""
-    Write-Host $line -ForegroundColor Cyan
-    Write-Host "  $Title" -ForegroundColor Cyan
-    Write-Host $line -ForegroundColor Cyan
-    Write-Host ""
-
-    if ($Script:LogEnabled) {
-        Add-Content -Path $Script:LogFile -Value ""
-        Add-Content -Path $Script:LogFile -Value $line
-        Add-Content -Path $Script:LogFile -Value "  $Title"
-        Add-Content -Path $Script:LogFile -Value $line
-    }
-}
-
-function Write-Section {
-    param([string]$Title)
-
-    Write-Host ""
-    Write-Host "--- $Title ---" -ForegroundColor Magenta
-    if ($Script:LogEnabled) {
-        Add-Content -Path $Script:LogFile -Value ""
-        Add-Content -Path $Script:LogFile -Value "--- $Title ---"
-    }
-}
-
-# ============================================================
-# User Interaction Functions
-# ============================================================
-function Read-YesNo {
-    param(
-        [string]$Prompt,
-        [bool]$Default = $false
-    )
-
-    $defaultHint = if ($Default) { "[Y/n]" } else { "[y/N]" }
-    Write-Host "$Prompt $defaultHint : " -NoNewline -ForegroundColor Yellow
-    $response = Read-Host
-
-    if ([string]::IsNullOrWhiteSpace($response)) {
-        return $Default
-    }
-
-    return $response -match '^[Yy]'
-}
-
-function Read-KeyPress {
-    param([string]$Prompt)
-
-    Write-Host $Prompt -NoNewline -ForegroundColor Yellow
-    $key = [System.Console]::ReadKey($true)
-    Write-Host $key.KeyChar
-
-    if ($key.Key -eq [ConsoleKey]::Escape) {
-        return $null
-    }
-
-    return $key.KeyChar.ToString().ToUpper()
-}
-
-function Select-FromList {
-    param(
-        [Parameter(Mandatory)]
-        [object[]]$Items,
-        [string]$Prompt = "Please choose an option"
-    )
-
-    Write-Host ""
-    for ($i = 0; $i -lt $Items.Length; $i++) {
-        Write-Host "  [$($i + 1)] " -NoNewline -ForegroundColor Cyan
-        Write-Host $Items[$i]
-    }
-    Write-Host ""
-
-    do {
-        Write-Host "$Prompt (1-$($Items.Length)): " -NoNewline -ForegroundColor Yellow
-        $choice = Read-Host
-        $selectedNumber = $choice -as [int]
-    } while ($selectedNumber -lt 1 -or $selectedNumber -gt $Items.Length)
-
-    return $Items[$selectedNumber - 1]
-}
-
-# ============================================================
-# Drive Detection Functions
-# ============================================================
-function Get-USBDrives {
-    <#
-    .SYNOPSIS
-        Lists all USB storage devices with their partitions
-    #>
-
-    $usbDisks = Get-Disk | Where-Object { $_.BusType -eq 'USB' -and $_.Size -gt 0 }
-
-    if ($usbDisks.Count -eq 0) {
-        Write-Log "No USB storage devices with media found." -Level Warning
-        return @()
-    }
-
-    $drives = @()
-
-    foreach ($disk in $usbDisks) {
-        $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
-
-        if ($partitions) {
-            foreach ($partition in $partitions) {
-                $volume = Get-Volume -Partition $partition -ErrorAction SilentlyContinue
-                $sizeGB = [math]::Round($partition.Size / 1GB, 2)
-                $driveLetter = if ($volume.DriveLetter) { "$($volume.DriveLetter):" } else { $null }
-                $fileSystem = if ($volume.FileSystem) { $volume.FileSystem } else { "RAW" }
-                $label = if ($volume.FileSystemLabel) { $volume.FileSystemLabel } else { "No Label" }
-
-                $drives += [PSCustomObject]@{
-                    DiskNumber      = $disk.Number
-                    DiskName        = $disk.FriendlyName
-                    PartitionNumber = $partition.PartitionNumber
-                    DriveLetter     = $driveLetter
-                    SizeGB          = $sizeGB
-                    FileSystem      = $fileSystem
-                    Label           = $label
-                    TotalDiskSizeGB = [math]::Round($disk.Size / 1GB, 2)
-                }
-            }
-        } else {
-            # Disk has no partitions
-            $drives += [PSCustomObject]@{
-                DiskNumber      = $disk.Number
-                DiskName        = $disk.FriendlyName
-                PartitionNumber = 0
-                DriveLetter     = $null
-                SizeGB          = 0
-                FileSystem      = "Unallocated"
-                Label           = "No Partitions"
-                TotalDiskSizeGB = [math]::Round($disk.Size / 1GB, 2)
-            }
-        }
-    }
-
-    return $drives
-}
-
-function Show-USBDrives {
-    <#
-    .SYNOPSIS
-        Displays USB drives in a formatted table
-    #>
-    param([array]$Drives)
-
-    if ($Drives.Count -eq 0) {
-        Write-Log "No USB drives found." -Level Warning
-        return
-    }
-
-    Write-Host ""
-    Write-Host "  USB Storage Devices Found:" -ForegroundColor Cyan
-    Write-Host "  " + ("-" * 56) -ForegroundColor DarkGray
-
-    foreach ($drive in $Drives) {
-        $letterDisplay = if ($drive.DriveLetter) { $drive.DriveLetter } else { "--" }
-        $info = "  Disk $($drive.DiskNumber) | $letterDisplay | $($drive.SizeGB)GB | $($drive.FileSystem) | $($drive.Label)"
-
-        if ($drive.DriveLetter) {
-            Write-Host $info -ForegroundColor White
-        } else {
-            Write-Host $info -ForegroundColor DarkGray
-        }
-    }
-
-    Write-Host "  " + ("-" * 56) -ForegroundColor DarkGray
-    Write-Host "  Device: " -NoNewline -ForegroundColor DarkGray
-
-    $diskNames = $Drives | Select-Object -ExpandProperty DiskName -Unique
-    Write-Host ($diskNames -join ", ") -ForegroundColor DarkGray
-    Write-Host ""
-}
+# Note: Get-USBDrives, Show-USBDrives, Select-DriveLetter are in DeviceRebuild.psm1
 
 function Select-USBDisk {
     <#
@@ -288,68 +94,6 @@ function Select-USBDisk {
     return $selectedDisk
 }
 
-function Select-DriveLetter {
-    <#
-    .SYNOPSIS
-        Prompts user to select a drive letter from available USB partitions
-    #>
-    param(
-        [string]$Purpose = "operation",
-        [switch]$AllowUnpartitioned
-    )
-
-    $drives = Get-USBDrives
-    Show-USBDrives -Drives $drives
-
-    # Filter to drives with letters (and partitions)
-    $availableDrives = $drives | Where-Object { $_.DriveLetter -ne $null }
-
-    if ($availableDrives.Count -eq 0) {
-        if ($AllowUnpartitioned -and ($drives | Where-Object { $_.FileSystem -eq 'Unallocated' })) {
-            Write-Log "USB disk found but has no partitions. Format required." -Level Warning
-            return $null
-        }
-        Write-Log "No USB partitions with drive letters found." -Level Error
-        return $null
-    }
-
-    while ($true) {
-        $letter = Read-KeyPress "Enter drive letter for $Purpose (or Esc to cancel): "
-
-        if ($null -eq $letter) {
-            Write-Log "Operation cancelled." -Level Warning
-            return $null
-        }
-
-        $driveLetter = "${letter}:"
-        $selectedDrive = $availableDrives | Where-Object { $_.DriveLetter -eq $driveLetter }
-
-        if (-not $selectedDrive) {
-            Write-Log "Drive $driveLetter is not a valid USB partition." -Level Warning
-            continue
-        }
-
-        # Safety check - don't format drives with Windows directory
-        if (Test-Path "$driveLetter\Windows") {
-            Write-Log "Drive $driveLetter contains a Windows directory. Skipping for safety." -Level Warning
-            continue
-        }
-
-        Write-Log "Selected: $driveLetter ($($selectedDrive.Label), $($selectedDrive.SizeGB)GB, $($selectedDrive.FileSystem))" -Level Success
-
-        return [PSCustomObject]@{
-            DriveLetter = $driveLetter
-            DiskNumber  = $selectedDrive.DiskNumber
-            SizeGB      = $selectedDrive.SizeGB
-            FileSystem  = $selectedDrive.FileSystem
-            Label       = $selectedDrive.Label
-        }
-    }
-}
-
-# ============================================================
-# Core Operations
-# ============================================================
 function Format-USBDrive {
     <#
     .SYNOPSIS
@@ -382,7 +126,7 @@ function Format-USBDrive {
 select disk $($disk.Number)
 clean
 convert mbr
-create partition primary size=2048
+create partition primary size=3072
 select partition 1
 active
 format fs=FAT32 quick label="WinPE"
@@ -409,7 +153,7 @@ exit
 
     if ($process.ExitCode -eq 0) {
         Write-Log "Disk formatted successfully." -Level Success
-        Write-Log "  WinPE partition: P: (2GB FAT32)" -Level Info
+        Write-Log "  WinPE partition: P: (3GB FAT32)" -Level Info
         Write-Log "  Images partition: I: (NTFS)" -Level Info
 
         return [PSCustomObject]@{
@@ -426,7 +170,7 @@ exit
 function Install-WinPE {
     <#
     .SYNOPSIS
-        Applies WinPE WIM to a partition
+        Applies a WinPE WIM file to a partition using DISM /Apply-Image.
     #>
     param(
         [Parameter(Mandatory)]
@@ -447,12 +191,13 @@ function Install-WinPE {
     Write-Log "  Source: $WimFile" -Level Info
 
     try {
-        $dismArgs = "/Apply-Image /ImageFile:`"$WimFile`" /Index:1 /ApplyDir:$DriveLetter /Verify"
-        Write-Log "Running DISM..." -Level Info
+        # Use call operator to avoid Start-Process -Wait hanging on DismHost.exe
+        # child processes that outlive dism.exe itself.
+        Write-Host ""
+        & dism.exe /Apply-Image "/ImageFile:$WimFile" /Index:1 "/ApplyDir:$DriveLetter"
+        $dismExitCode = $LASTEXITCODE
 
-        $process = Start-Process -FilePath "dism.exe" -ArgumentList $dismArgs -NoNewWindow -Wait -PassThru
-
-        if ($process.ExitCode -eq 0) {
+        if ($dismExitCode -eq 0) {
             Write-Log "WinPE applied successfully." -Level Success
 
             # Create marker file on WinPE partition for safety
@@ -476,68 +221,12 @@ DEPLOYKEY_MARKER=TRUE
 
             return $true
         } else {
-            Write-Log "DISM failed with exit code: $($process.ExitCode)" -Level Error
+            Write-Log "DISM failed with exit code: $dismExitCode" -Level Error
             return $false
         }
     }
     catch {
         Write-Log "Error applying WinPE: $_" -Level Error
-        return $false
-    }
-}
-
-function Remove-StaleWimMount {
-    <#
-    .SYNOPSIS
-        Finds and discards any stale DISM mount for a given WIM file.
-        Uses Get-WindowsImage -Mounted (structured, non-localized) instead of
-        parsing DISM text output so it works regardless of Windows language.
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [string]$WimFilePath
-    )
-
-    Write-Log "Querying DISM for stale mounts of: $WimFilePath" -Level Warning
-
-    try {
-        $stale = Get-WindowsImage -Mounted -ErrorAction Stop |
-                 Where-Object { $_.ImagePath -ieq $WimFilePath }
-
-        if (-not $stale) {
-            Write-Log "No stale DISM mount found for this WIM." -Level Warning
-            return $false
-        }
-
-        $cleaned = $false
-        foreach ($img in $stale) {
-            Write-Log "Discarding stale mount at: $($img.MountPath)" -Level Warning
-            $p = Start-Process -FilePath "dism.exe" `
-                -ArgumentList "/Unmount-Image /MountDir:`"$($img.MountPath)`" /Discard" `
-                -NoNewWindow -Wait -PassThru
-
-            if ($p.ExitCode -eq 0) {
-                Write-Log "Stale mount discarded." -Level Success
-                $cleaned = $true
-            } else {
-                # Discard can fail if the WIM file was replaced (e.g. USB reformatted).
-                # Still force a Cleanup-Wim so the orphaned record is cleared for the retry.
-                Write-Log "Failed to discard stale mount (exit code: $($p.ExitCode)) - WIM file may have been replaced. Forcing Cleanup-Wim." -Level Warning
-                $cleaned = $true
-            }
-        }
-
-        if ($cleaned) {
-            # Clean up DISM's internal mount metadata to prevent the retry from hanging
-            Write-Log "Running Dism /Cleanup-Wim to clear residual mount metadata..." -Level Info
-            Start-Process -FilePath "dism.exe" -ArgumentList "/Cleanup-Wim" -NoNewWindow -Wait | Out-Null
-            Write-Log "DISM cleanup complete." -Level Info
-        }
-
-        return $cleaned
-    }
-    catch {
-        Write-Log "Error querying mounted images: $_" -Level Error
         return $false
     }
 }
@@ -568,35 +257,37 @@ function Update-StartnetCmd {
 
     # Clean up and create mount directory
     if (Test-Path $mountDir) {
+        $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
         Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
+        $ProgressPreference = $p
     }
     New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
 
+    # Proactive stale mount cleanup before attempting mount
+    Remove-StaleWimMount -WimFilePath $bootWim | Out-Null
+
     try {
-        # Mount boot.wim
+        # Mount boot.wim — use call operator to avoid Start-Process -Wait hanging
+        # on DismHost.exe child processes that outlive dism.exe itself
         Write-Log "Mounting boot.wim to inject startnet.cmd..." -Level Info
-        $process = Start-Process -FilePath "dism.exe" `
-            -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
-            -NoNewWindow -Wait -PassThru
+        Write-Host ""
+        & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
+        $dismExitCode = $LASTEXITCODE
 
-        # 0xC1420127: image already mounted from a previous interrupted session
-        if ($process.ExitCode -eq -1052638937) {
-            Write-Log "boot.wim is already mounted (previous session was interrupted)." -Level Warning
-
+        if ($dismExitCode -ne 0) {
+            Write-Log "Mount failed (exit code: $dismExitCode) — attempting stale mount recovery..." -Level Warning
             if (Remove-StaleWimMount -WimFilePath $bootWim) {
                 Write-Log "Retrying mount..." -Level Info
-                # Recreate a clean mount directory after the discard
-                if (Test-Path $mountDir) { Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue }
+                if (Test-Path $mountDir) { $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'; Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue; $ProgressPreference = $p }
                 New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
-
-                $process = Start-Process -FilePath "dism.exe" `
-                    -ArgumentList "/Mount-Image /ImageFile:`"$bootWim`" /Index:1 /MountDir:`"$mountDir`"" `
-                    -NoNewWindow -Wait -PassThru
+                Write-Host ""
+                & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
+                $dismExitCode = $LASTEXITCODE
             }
         }
 
-        if ($process.ExitCode -ne 0) {
-            Write-Log "Failed to mount boot.wim (exit code: $($process.ExitCode))" -Level Error
+        if ($dismExitCode -ne 0) {
+            Write-Log "Failed to mount boot.wim (exit code: $dismExitCode)" -Level Error
             return $false
         }
 
@@ -607,13 +298,13 @@ function Update-StartnetCmd {
 
         # Unmount and commit
         Write-Log "Committing boot.wim..." -Level Info
-        $process = Start-Process -FilePath "dism.exe" `
-            -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Commit" `
-            -NoNewWindow -Wait -PassThru
+        Write-Host ""
+        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Commit
+        $dismExitCode = $LASTEXITCODE
 
-        if ($process.ExitCode -ne 0) {
-            Write-Log "Failed to commit boot.wim (exit code: $($process.ExitCode))" -Level Error
-            Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
+        if ($dismExitCode -ne 0) {
+            Write-Log "Failed to commit boot.wim (exit code: $dismExitCode)" -Level Error
+            & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
             return $false
         }
 
@@ -622,7 +313,7 @@ function Update-StartnetCmd {
     }
     catch {
         Write-Log "Error updating startnet.cmd: $_" -Level Error
-        Start-Process -FilePath "dism.exe" -ArgumentList "/Unmount-Image /MountDir:`"$mountDir`" /Discard" -NoNewWindow -Wait | Out-Null
+        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
         return $false
     }
     finally {
@@ -667,7 +358,9 @@ function Add-WinPEDrivers {
 
     # Clean and recreate mount directory
     if (Test-Path $mountDir) {
+        $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
         Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
+        $ProgressPreference = $p
     }
     New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
 
@@ -684,7 +377,7 @@ function Add-WinPEDrivers {
             Write-Log "Mount failed (exit code: $dismExitCode) — attempting stale mount recovery..." -Level Warning
             if (Remove-StaleWimMount -WimFilePath $bootWim) {
                 Write-Log "Retrying mount..." -Level Info
-                if (Test-Path $mountDir) { Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue }
+                if (Test-Path $mountDir) { $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'; Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue; $ProgressPreference = $p }
                 New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
                 Write-Host ""
                 & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
@@ -804,119 +497,46 @@ DEPLOYKEY_MARKER=TRUE
     }
 }
 
-function Find-RSTDriverPath {
-    <#
-    .SYNOPSIS
-        Returns the RST/storage driver subfolder within a driver directory,
-        or $null if none is found.
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [string]$DriverDir
-    )
-
-    $rst = Join-Path $DriverDir "Rapid Storage"
-    if (Test-Path $rst -PathType Container) { return $rst }
-
-    $alt = Get-ChildItem -Path $DriverDir -Directory -Recurse -ErrorAction SilentlyContinue |
-           Where-Object { $_.Name -match 'Storage|RST|IRST' } |
-           Select-Object -First 1
-
-    return if ($alt) { $alt.FullName } else { $null }
-}
-
-function Copy-FileWithProgress {
-    <#
-    .SYNOPSIS
-        Copies a single file with byte-level progress reporting.
-        Designed for large WIM files where Copy-Item gives no feedback.
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [string]$Source,
-
-        [Parameter(Mandatory)]
-        [string]$Destination,
-
-        # Total bytes in the batch (for overall % across multiple files)
-        [long]$TotalBatchBytes = 0,
-
-        # Bytes already copied before this file
-        [long]$BytesBefore = 0
-    )
-
-    $fileName  = Split-Path $Source -Leaf
-    $fileBytes = (Get-Item $Source).Length
-    $destPath  = if (Test-Path $Destination -PathType Container) {
-                     Join-Path $Destination $fileName
-                 } else { $Destination }
-
-    $bufferSize = 4194304  # 4 MB
-    $buffer     = New-Object byte[] $bufferSize
-
-    $src = [System.IO.File]::OpenRead($Source)
-    $dst = [System.IO.File]::Open($destPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
-
-    try {
-        $copied = 0L
-        while ($true) {
-            $read = $src.Read($buffer, 0, $bufferSize)
-            if ($read -eq 0) { break }
-            $dst.Write($buffer, 0, $read)
-            $copied += $read
-
-            $fileMB    = [math]::Round($copied   / 1MB, 0)
-            $fileTotMB = [math]::Round($fileBytes / 1MB, 0)
-            $pct = if ($TotalBatchBytes -gt 0) {
-                       [math]::Round(($BytesBefore + $copied) / $TotalBatchBytes * 100, 0)
-                   } else {
-                       [math]::Round($copied / $fileBytes * 100, 0)
-                   }
-
-            Write-Progress -Activity "Copying WIM Files" `
-                           -Status "${fileName}  ${fileMB} / ${fileTotMB} MB" `
-                           -PercentComplete $pct
-        }
-    }
-    finally {
-        $src.Close()
-        $dst.Close()
-    }
-}
-
 function Copy-ModelWIMs {
     <#
     .SYNOPSIS
         Copies model-specific WIM files (and optional drivers) to the USB drive.
+        Supports two-level LNK redirect markers to avoid WIM duplication.
 
         Source directory structure under WimSourceDirectory:
-          <AnyName>\                  - directory name is used as model string (no model.ini)
-          <AnyName>\model.ini         - overrides model string (ModelString=<value>)
-          <AnyName>\Drivers\          - drivers to inject; copied to I:\Drivers\<ModelString>\
+          <ModelName>\                          - self-contained: all WIMs + optional Drivers
+          <ModelName>\model.ini                 - overrides model string (ModelString=<value>)
+          <ModelName>\LNK-<Src>.txt             - Level 1 redirect: if <Src> is a model dir, WIMs come from <Src>\
+          <Src>\LNK-<Ver>.txt                   - Level 2 redirect: if <Ver> is not a model dir, OS from Windows_WIM_Root\<Ver>\
+          <ModelName>\Drivers\LNK-<Src>.txt     - Driver redirect: drivers from Shared_Drivers_Location\<Src>\
 
-        Display format in the selection list:
-          B9450FA (Pure)                       - no model.ini, no Drivers : dir name = model, factory capture
-          B9450FA (Pure + Drivers)             - no model.ini, Drivers present : dir name = model, vanilla OS
-          EXPERTBOOK_B9450FA_OEM [B9450FA]     - model.ini present, no Drivers : descriptive name, factory capture
-          EXPERTBOOK_B9450FA_PRO [B9450FA] (Drivers) - model.ini present, Drivers present : descriptive name, vanilla OS
+        Selection label examples:
+          B9450FA (Pure)                                no redirects, no Drivers
+          B9450FA (Pure + Drivers)                      no redirects, own Drivers present
+          B9450FA (Pure + Drivers->B5402CB)             drivers from B5402CB\Drivers\
+          B5402CB (Pure)  ->  B9450FA                   Level 1 only: OS from B9450FA\
+          B5402CB (Pure)  ->  B9450FA  [OS: W11-25H2]   Level 1+2: OS from WinWimRoot
+          B5402CB (Pure)  [OS: W11-25H2]                Level 2 only: OS from WinWimRoot
     #>
     param(
         [Parameter(Mandatory)]
         [string]$DriveLetter,
 
         [Parameter(Mandatory)]
-        [string]$WimSourceDirectory
+        [string]$WimSourceDirectory,
+
+        [string]$WinWimRoot,
+
+        [string]$SharedDriversLocation
     )
 
     Write-Section "Copy Model WIMs"
 
-    # Validate WIM source directory
     if (-not (Test-Path $WimSourceDirectory -PathType Container)) {
         Write-Log "WIM source directory not found: $WimSourceDirectory" -Level Error
         return $false
     }
 
-    # Enumerate all subdirectories - no name-length restriction (dirs can be descriptive)
     $modelDirs = Get-ChildItem -Path $WimSourceDirectory -Directory
 
     if ($modelDirs.Count -eq 0) {
@@ -924,49 +544,110 @@ function Copy-ModelWIMs {
         return $false
     }
 
-    # Build enriched list: resolve model name eagerly so it appears in the label
+    # ============================================================
+    # Build enriched entry list
+    # ============================================================
     $entries = foreach ($dir in $modelDirs) {
         $hasModelIni = Test-Path (Join-Path $dir.FullName "model.ini")
         $hasDrivers  = Test-Path (Join-Path $dir.FullName "Drivers") -PathType Container
 
-        # A directory without model.ini must have a name that IS a valid model string
-        # (typically 6-10 characters, no separators). Warn and skip if it looks descriptive.
-        if (-not $hasModelIni -and $dir.Name.Length -gt 10) {
-            Write-Log "Skipping '$($dir.Name)': name is too long for a model string and no model.ini found." -Level Warning
+        # Detect driver LNK: LNK-<model>.txt inside the Drivers\ folder
+        $lnkDrivers = $null
+        if ($hasDrivers) {
+            $drvLnkFile = Get-ChildItem -Path (Join-Path $dir.FullName "Drivers") -File `
+                              -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -match '^LNK-(.+)\.txt$' } |
+                          Select-Object -First 1
+            if ($drvLnkFile) {
+                $lnkDrivers = [regex]::Match($drvLnkFile.Name, '^LNK-(.+)\.txt$').Groups[1].Value
+            }
+        }
+
+        $hasAnyLnk = (Get-ChildItem -Path $dir.FullName -File -Filter "LNK-*.txt" `
+                          -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0
+
+        # Allow any directory whose name matches the "<ModelCode> - <desc>" convention
+        $matchesConvention = $dir.Name -match '^[A-Za-z0-9]+ - '
+
+        if (-not $hasModelIni -and -not $hasAnyLnk -and -not $lnkDrivers -and -not $matchesConvention -and $dir.Name.Length -gt 10) {
+            Write-Log "Skipping '$($dir.Name)': name too long and no model.ini or LNK found." -Level Warning
             continue
         }
 
-        # Resolve ModelString now so we can embed it in the label
-        $modelString = $dir.Name   # default: directory name IS the model
+        # Resolve ModelString
+        # Priority: model.ini > convention (part before first ' - ') > dir name
+        $modelString = $dir.Name
         if ($hasModelIni) {
-            $modelIniPath = Join-Path $dir.FullName "model.ini"
-            $modelLine = Get-Content $modelIniPath -ErrorAction SilentlyContinue |
-                         Where-Object { $_ -match '^ModelString=' } |
-                         Select-Object -First 1
+            $modelLine = Get-Content (Join-Path $dir.FullName "model.ini") -ErrorAction SilentlyContinue |
+                         Where-Object { $_ -match '^ModelString=' } | Select-Object -First 1
             if ($modelLine) {
                 $parsed = ($modelLine -split '=', 2)[1].Trim()
                 if ($parsed) { $modelString = $parsed }
             }
+        } elseif ($dir.Name -match '^([^ ]+) - ') {
+            $modelString = $Matches[1]
+        }
+
+        # LNK detection: all LNK files use .txt extension.
+        # A LNK whose target resolves to a model directory = Level 1 (WIM source redirect).
+        # A LNK whose target does not resolve to a model directory = Level 2 (OS version).
+        $lnkSource     = $null
+        $lnkSourcePath = $null
+        $lnkOs         = $null
+
+        $rootLnk = Get-ChildItem -Path $dir.FullName -File -Filter "LNK-*.txt" `
+                       -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($rootLnk) {
+            $lnkTarget    = [regex]::Match($rootLnk.Name, '^LNK-(.+)\.txt$').Groups[1].Value
+            $resolvedPath = Resolve-ModelDirectory -ModelName $lnkTarget -WimSourceDirectory $WimSourceDirectory
+            if ($resolvedPath) {
+                # Level 1: target is a model directory — WIMs come from there
+                $lnkSource     = $lnkTarget
+                $lnkSourcePath = $resolvedPath
+                # Level 2: look for OS version LNK inside the Level 1 source dir
+                $lnkOsFile = Get-ChildItem -Path $lnkSourcePath -File -Filter "LNK-*.txt" `
+                                 -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($lnkOsFile) {
+                    $lnkOs = [regex]::Match($lnkOsFile.Name, '^LNK-(.+)\.txt$').Groups[1].Value
+                }
+            } else {
+                # Level 2 only: no Level 1 redirect, target is an OS version name
+                $lnkOs = $lnkTarget
+            }
         }
 
         # Build display label
-        #   No model.ini  -> (Pure) or (Pure + Drivers)   : dir name IS the model string
-        #   Has model.ini -> [RealModel] with optional (Drivers) : descriptive dir name
         $label = if (-not $hasModelIni) {
-            $tag = if ($hasDrivers) { " (Pure + Drivers)" } else { " (Pure)" }
-            "$($dir.Name)$tag"
+            $drvTag = if (-not $hasDrivers)  { ' (Pure)' }
+                      elseif ($lnkDrivers)   { " (Pure + Drivers->$lnkDrivers)" }
+                      else                   { ' (Pure + Drivers)' }
+            "$($dir.Name)$drvTag"
         } else {
-            $tag = if ($hasDrivers) { " (Drivers)" } else { "" }
-            "$($dir.Name) [$modelString]$tag"
+            $drvTag = if (-not $hasDrivers)  { '' }
+                      elseif ($lnkDrivers)   { " (Drivers->$lnkDrivers)" }
+                      else                   { ' (Drivers)' }
+            "$($dir.Name) [$modelString]$drvTag"
+        }
+
+        if ($lnkSource -and $lnkOs) {
+            $label += "  ->  $lnkSource  [OS: $lnkOs]"
+        } elseif ($lnkSource) {
+            $label += "  ->  $lnkSource"
+        } elseif ($lnkOs) {
+            $label += "  [OS: $lnkOs]"
         }
 
         [PSCustomObject]@{
-            Label       = $label
-            DirName     = $dir.Name
-            Path        = $dir.FullName
-            HasModelIni = $hasModelIni
-            HasDrivers  = $hasDrivers
-            ModelString = $modelString
+            Label          = $label
+            DirName        = $dir.Name
+            Path           = $dir.FullName
+            HasModelIni    = $hasModelIni
+            HasDrivers     = $hasDrivers
+            ModelString    = $modelString
+            LnkSource      = $lnkSource
+            LnkSourcePath  = $lnkSourcePath    # resolved directory path
+            LnkOs          = $lnkOs
+            LnkDrivers     = $lnkDrivers
         }
     }
 
@@ -980,29 +661,122 @@ function Copy-ModelWIMs {
 
     $destination = "${DriveLetter}\"
 
-    # Update config.ini with resolved model name and auto-detected edition index
+    # ============================================================
+    # Resolve WIM file list with source paths and destination names
+    # ============================================================
+    # Each entry: [PSCustomObject]@{ SourcePath; DestName; Length }
+    $filesToCopy = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    if ($selected.LnkSource) {
+        # Level 1 redirect: OS (and un-overridden WIMs) come from the source model dir.
+        # SYSTEM / RECOVERY / MYASUS WIMs may be present directly in the model dir.
+        $sourceDir = $selected.LnkSourcePath
+
+        if (-not $sourceDir -or -not (Test-Path $sourceDir -PathType Container)) {
+            Write-Log "Level 1 redirect target not found for: $($selected.LnkSource)" -Level Error
+            Write-Log "  Expected a directory under: $WimSourceDirectory" -Level Warning
+            return $false
+        }
+
+        # WIMs already present in the model dir — rename to targetModel convention
+        foreach ($f in (Get-ChildItem -Path $selected.Path -File |
+                         Where-Object { $_.Extension -in @('.wim', '.swm') })) {
+            $destName = Get-WimDestName -SourceName $f.Name -TargetModel $modelString
+            $filesToCopy.Add([PSCustomObject]@{ SourcePath = $f.FullName; DestName = $destName; Length = $f.Length })
+        }
+
+        # WIMs from Level 1 source dir — rename to targetModel convention
+        $sourceDirWims = @(Get-ChildItem -Path $sourceDir -File |
+                           Where-Object { $_.Extension -in @('.wim', '.swm') })
+
+        if ($selected.LnkOs) {
+            # Level 2: exclude OS files from the source dir (they come from WinWimRoot)
+            $sourceDirWims = @($sourceDirWims | Where-Object {
+                $basePart = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+                $partType = if ($basePart -match '-([^-]+)$') { $Matches[1] } else { $basePart }
+                $partType -notmatch '^OS'
+            })
+        }
+
+        foreach ($f in $sourceDirWims) {
+            $destName = Get-WimDestName -SourceName $f.Name -TargetModel $modelString
+            $filesToCopy.Add([PSCustomObject]@{ SourcePath = $f.FullName; DestName = $destName; Length = $f.Length })
+        }
+
+        # Level 2: OS from WinWimRoot
+        if ($selected.LnkOs) {
+            if ([string]::IsNullOrWhiteSpace($WinWimRoot)) {
+                Write-Log "LNK-OS redirect requires Windows_WIM_Root in config.psd1" -Level Error
+                return $false
+            }
+            $externalOsPath = Join-Path $WinWimRoot "$($selected.LnkOs)\$($selected.LnkOs).wim"
+            if (-not (Test-Path $externalOsPath)) {
+                Write-Log "LNK-OS-$($selected.LnkOs): file not found: $externalOsPath" -Level Error
+                return $false
+            }
+            $osFile = Get-Item $externalOsPath
+            Write-Log "OS WIM source: $externalOsPath  [LNK-OS-$($selected.LnkOs)]" -Level Info
+            $filesToCopy.Add([PSCustomObject]@{ SourcePath = $osFile.FullName; DestName = "$modelString-OS.wim"; Length = $osFile.Length })
+        }
+
+    } elseif ($selected.LnkOs) {
+        # Level 2 only (no Level 1): OS from WinWimRoot, other WIMs from model dir
+        if ([string]::IsNullOrWhiteSpace($WinWimRoot)) {
+            Write-Log "LNK-OS redirect requires Windows_WIM_Root in config.psd1" -Level Error
+            return $false
+        }
+        $externalOsPath = Join-Path $WinWimRoot "$($selected.LnkOs)\$($selected.LnkOs).wim"
+        if (-not (Test-Path $externalOsPath)) {
+            Write-Log "LNK-OS-$($selected.LnkOs): file not found: $externalOsPath" -Level Error
+            return $false
+        }
+        $osFile = Get-Item $externalOsPath
+        Write-Log "OS WIM source: $externalOsPath  [LNK-OS-$($selected.LnkOs)]" -Level Info
+        $filesToCopy.Add([PSCustomObject]@{ SourcePath = $osFile.FullName; DestName = "$modelString-OS.wim"; Length = $osFile.Length })
+
+        # Other WIMs from model dir (exclude OS) — rename to targetModel convention
+        foreach ($f in (Get-ChildItem -Path $selected.Path -File |
+                         Where-Object { $_.Extension -in @('.wim', '.swm') })) {
+            $basePart = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            $partType = if ($basePart -match '-([^-]+)$') { $Matches[1] } else { $basePart }
+            if ($partType -match '^OS') { continue }
+            $destName = Get-WimDestName -SourceName $f.Name -TargetModel $modelString
+            $filesToCopy.Add([PSCustomObject]@{ SourcePath = $f.FullName; DestName = $destName; Length = $f.Length })
+        }
+
+    } else {
+        # No LNK: copy all WIMs from model dir — rename to targetModel convention
+        foreach ($f in (Get-ChildItem -Path $selected.Path -File |
+                         Where-Object { $_.Extension -in @('.wim', '.swm') })) {
+            $destName = Get-WimDestName -SourceName $f.Name -TargetModel $modelString
+            $filesToCopy.Add([PSCustomObject]@{ SourcePath = $f.FullName; DestName = $destName; Length = $f.Length })
+        }
+    }
+
+    if ($filesToCopy.Count -eq 0) {
+        Write-Log "No WIM/SWM files resolved to copy." -Level Warning
+        return $false
+    }
+
+    # ============================================================
+    # Update config.ini (ModelString + EditionIndex)
+    # ============================================================
     $configFile = Join-Path $destination "config.ini"
     if (Test-Path $configFile) {
         $content = Get-Content $configFile
-
-        # Always update ModelString
         $content = $content -replace '^ModelString=.*', "ModelString=$modelString"
         Write-Log "Updating config.ini: ModelString=$modelString" -Level Info
 
-        # Auto-detect Pro edition index from the OS WIM (source, before copy)
-        $osWimSource = Get-ChildItem -Path $selected.Path -File |
-                       Where-Object { $_.Name -match '^.*-OS\.wim$' -or $_.Name -match '^.*-OS\.swm$' } |
-                       Select-Object -First 1
-
-        if ($osWimSource) {
+        # Find OS WIM source for Pro edition detection
+        $osEntry = $filesToCopy | Where-Object { $_.DestName -match '-OS\.wim$' } | Select-Object -First 1
+        if ($osEntry) {
             try {
-                $images = Get-WindowsImage -ImagePath $osWimSource.FullName -ErrorAction Stop
+                $images = Get-WindowsImage -ImagePath $osEntry.SourcePath -ErrorAction Stop
                 $proImage = $images | Where-Object { $_.ImageName -match '\bPro\b' } | Select-Object -First 1
 
                 if ($proImage) {
                     $detectedIndex = $proImage.ImageIndex
                     Write-Log "Detected Pro edition: '$($proImage.ImageName)' at index $detectedIndex" -Level Success
-
                     if ($content -match '^EditionIndex=') {
                         $content = $content -replace '^EditionIndex=.*', "EditionIndex=$detectedIndex"
                     } else {
@@ -1012,8 +786,8 @@ function Copy-ModelWIMs {
                 } elseif ($images.Count -eq 1) {
                     Write-Log "Single-edition WIM ($($images[0].ImageName)) — EditionIndex left as-is." -Level Info
                 } else {
-                    Write-Log "No Pro edition found in WIM ($($images.Count) editions present) — EditionIndex left as-is." -Level Warning
-                    Write-Log "Available editions: $(($images | Select-Object -ExpandProperty ImageName) -join ', ')" -Level Warning
+                    Write-Log "No Pro edition found in WIM — EditionIndex left as-is." -Level Warning
+                    Write-Log "Available: $(($images | Select-Object -ExpandProperty ImageName) -join ', ')" -Level Warning
                 }
             }
             catch {
@@ -1021,53 +795,64 @@ function Copy-ModelWIMs {
                 Write-Log "EditionIndex left as-is in config.ini." -Level Warning
             }
         } else {
-            Write-Log "No OS WIM found in source — EditionIndex left as-is." -Level Warning
+            Write-Log "No OS WIM resolved — EditionIndex left as-is." -Level Warning
         }
 
         Set-Content -Path $configFile -Value $content
     }
 
-    # Copy WIM/SWM files from the directory root only (exclude Drivers\ subfolder)
-    $wimFiles = Get-ChildItem -Path $selected.Path -File |
-                Where-Object { $_.Extension -in @('.wim', '.swm') }
-
-    if ($wimFiles.Count -eq 0) {
-        Write-Log "No WIM/SWM files found in $($selected.Path)" -Level Warning
-        return $false
-    }
-
-    $totalSizeBytes = ($wimFiles | Measure-Object -Property Length -Sum).Sum
+    # ============================================================
+    # Copy WIM files
+    # ============================================================
+    $totalSizeBytes = ($filesToCopy | Measure-Object -Property Length -Sum).Sum
     $totalSizeMB    = [math]::Round($totalSizeBytes / 1MB, 0)
-    Write-Log "Copying $($wimFiles.Count) WIM/SWM file(s) (${totalSizeMB} MB total)..." -Level Info
+    Write-Log "Copying $($filesToCopy.Count) WIM/SWM file(s) (${totalSizeMB} MB total)..." -Level Info
 
     $copiedBytes = 0L
-    foreach ($file in $wimFiles) {
-        Copy-FileWithProgress -Source $file.FullName -Destination $destination `
-                              -TotalBatchBytes $totalSizeBytes -BytesBefore $copiedBytes
-        $copiedBytes += $file.Length
+    foreach ($entry in $filesToCopy) {
+        $destPath = Join-Path $destination $entry.DestName
+        $srcName  = [System.IO.Path]::GetFileName($entry.SourcePath)
+        if ($srcName -ne $entry.DestName) {
+            Write-Log "  $srcName  ->  $($entry.DestName)" -Level Info
+        }
+        Copy-FileWithProgress -Source $entry.SourcePath -Destination $destPath `
+                              -TotalBatchBytes $totalSizeBytes -BytesBefore $copiedBytes `
+                              -Activity "Copying WIM Files"
+        $copiedBytes += $entry.Length
     }
 
     Write-Progress -Activity "Copying WIM Files" -Completed
 
     $totalSizeGB = [math]::Round($totalSizeBytes / 1GB, 2)
-    Write-Log "Copied $($wimFiles.Count) WIM/SWM file(s) (${totalSizeGB} GB total)." -Level Success
+    Write-Log "Copied $($filesToCopy.Count) WIM/SWM file(s) (${totalSizeGB} GB total)." -Level Success
 
-    # Copy drivers if present - required when Drivers\ folder exists
+    # ============================================================
+    # Copy drivers — resolves LNK-<model>.txt redirect in Drivers\ if present
+    # ============================================================
     if ($selected.HasDrivers) {
-        $driverSource = Join-Path $selected.Path "Drivers"
-        $driverDest   = Join-Path $destination "Drivers\$modelString"
+        $driversDir     = Join-Path $selected.Path "Drivers"
+        $driverResolved = Resolve-DriverLnk -DriversDir $driversDir -SharedDriversLocation $SharedDriversLocation
 
-        Write-Log "Copying drivers to Drivers\$modelString..." -Level Info
+        if ($driverResolved) {
+            if ($driverResolved.LinkedModel) {
+                Write-Log "Drivers: following LNK to $($driverResolved.LinkedModel)\Drivers..." -Level Info
+            }
 
-        try {
-            New-Item -Path $driverDest -ItemType Directory -Force | Out-Null
-            Copy-Item -Path "$driverSource\*" -Destination $driverDest -Recurse -Force
+            $driverSource = $driverResolved.Path
+            $driverDest   = Join-Path $destination "Drivers\$modelString"
 
-            $driverCount = (Get-ChildItem -Path $driverDest -Recurse -File).Count
-            Write-Log "Drivers copied ($driverCount files -> Drivers\$modelString)." -Level Success
-        }
-        catch {
-            Write-Log "Error copying drivers: $_" -Level Warning
+            Write-Log "Copying drivers to Drivers\$modelString..." -Level Info
+
+            try {
+                New-Item -Path $driverDest -ItemType Directory -Force | Out-Null
+                Copy-Item -Path "$driverSource\*" -Destination $driverDest -Recurse -Force
+
+                $driverCount = (Get-ChildItem -Path $driverDest -Recurse -File).Count
+                Write-Log "Drivers copied ($driverCount files -> Drivers\$modelString)." -Level Success
+            }
+            catch {
+                Write-Log "Error copying drivers: $_" -Level Warning
+            }
         }
     }
 
@@ -1095,19 +880,44 @@ if (-not (Test-Path $configPath)) {
     exit 1
 }
 
-$config = Import-PowerShellDataFile -Path $configPath
-$PE_WIM = $config["WinPE_WIM_Location"]
-$DEV_ROOT_WIM = $config["Device_Root_WIM_Location"]
+$config       = Import-PowerShellDataFile -Path $configPath
+$PE_WIM_ROOT      = $config["WinPE_WIM_Location"]
+$DEV_ROOT_WIM     = $config["Device_Root_WIM_Location"]
+$WIN_WIM_ROOT     = $config["Windows_WIM_Root"]
+$SHARED_DRV_ROOT  = $config["Shared_Drivers_Location"]
 
-Write-Log "WinPE WIM: $PE_WIM" -Level Info
+Write-Log "WinPE root: $PE_WIM_ROOT" -Level Info
 Write-Log "Device WIM Root: $DEV_ROOT_WIM" -Level Info
+if ($WIN_WIM_ROOT)    { Write-Log "Windows WIM Root: $WIN_WIM_ROOT" -Level Info }
+if ($SHARED_DRV_ROOT) { Write-Log "Shared Drivers: $SHARED_DRV_ROOT" -Level Info }
 
-# Validate WinPE WIM path (required for PE operations)
-$peWimValid = Test-Path -Path $PE_WIM -PathType Leaf
-if ($peWimValid) {
-    Write-Log "WinPE WIM file found." -Level Success
+# ============================================================
+# Select WinPE version
+# ============================================================
+Write-Section "Select WinPE Version"
+
+$PE_WIM     = $null
+$peWimValid = $false
+
+if (-not (Test-Path $PE_WIM_ROOT -PathType Container)) {
+    Write-Log "WinPE directory not found: $PE_WIM_ROOT" -Level Warning
+    Write-Log "Run ExtractPE.ps1 to populate this directory." -Level Warning
 } else {
-    Write-Log "WinPE WIM file not found (required for PE installation)." -Level Warning
+    $peEntries = @(Get-ChildItem -Path $PE_WIM_ROOT -Directory |
+                   Where-Object { Test-Path (Join-Path $_.FullName "boot.wim") } |
+                   ForEach-Object { [PSCustomObject]@{ Label = $_.Name; WimPath = Join-Path $_.FullName "boot.wim" } })
+
+    if ($peEntries.Count -eq 0) {
+        Write-Log "No boot.wim found in any subdirectory of: $PE_WIM_ROOT" -Level Warning
+        Write-Log "Run ExtractPE.ps1 to populate this directory." -Level Warning
+    } else {
+        $selectedLabel = Select-FromList -Items ($peEntries | Select-Object -ExpandProperty Label) `
+                                         -Prompt "Select WinPE version to use"
+        $selectedPE    = $peEntries | Where-Object { $_.Label -eq $selectedLabel }
+        $PE_WIM        = $selectedPE.WimPath
+        $peWimValid    = $true
+        Write-Log "Using WinPE: $PE_WIM" -Level Success
+    }
 }
 
 # Track what drive letters we're using
@@ -1177,14 +987,21 @@ if (Read-YesNo "Do you want to copy deployment scripts to USB?") {
 # ============================================================
 Write-Section "Step 4: Copy Model WIMs (Optional)"
 
-if ($imagesDrive -and (Read-YesNo "Do you want to copy model WIM files to ${imagesDrive}?")) {
+if (Read-YesNo "Do you want to copy model WIM files to USB?") {
 
-    # Validate Device WIM root only when needed
-    if (-not (Test-Path -Path $DEV_ROOT_WIM -PathType Container)) {
+    # Get Images drive if not already known from a previous step
+    if (-not $imagesDrive) {
+        $selectedDrive = Select-DriveLetter -Purpose "Images partition (NTFS)"
+        if ($selectedDrive) { $imagesDrive = $selectedDrive.DriveLetter }
+    }
+
+    if (-not $imagesDrive) {
+        Write-Log "No drive selected. Skipping." -Level Warning
+    } elseif (-not (Test-Path -Path $DEV_ROOT_WIM -PathType Container)) {
         Write-Log "Device WIM root directory not found: $DEV_ROOT_WIM" -Level Error
         Write-Log "Please update Device_Root_WIM_Location in config.psd1" -Level Warning
     } else {
-        Copy-ModelWIMs -DriveLetter $imagesDrive -WimSourceDirectory $DEV_ROOT_WIM
+        Copy-ModelWIMs -DriveLetter $imagesDrive -WimSourceDirectory $DEV_ROOT_WIM -WinWimRoot $WIN_WIM_ROOT -SharedDriversLocation $SHARED_DRV_ROOT
     }
 }
 
@@ -1241,11 +1058,15 @@ if (Read-YesNo "Do you want to inject drivers into WinPE boot.wim?") {
                     foreach ($dir in (Get-ChildItem $DEV_ROOT_WIM -Directory)) {
                         $srcDriverDir = Join-Path $dir.FullName "Drivers"
                         if (Test-Path $srcDriverDir -PathType Container) {
-                            $rst = Find-RSTDriverPath -DriverDir $srcDriverDir
-                            if ($rst) {
-                                $rstEntries += [PSCustomObject]@{
-                                    Label = "$($dir.Name)  [from repository]"
-                                    Path  = $rst
+                            $driverResolved = Resolve-DriverLnk -DriversDir $srcDriverDir -SharedDriversLocation $SHARED_DRV_ROOT
+                            if ($driverResolved) {
+                                $rst = Find-RSTDriverPath -DriverDir $driverResolved.Path
+                                if ($rst) {
+                                    $lnkSuffix = if ($driverResolved.LinkedModel) { "  [->$($driverResolved.LinkedModel)]" } else { '' }
+                                    $rstEntries += [PSCustomObject]@{
+                                        Label = "$($dir.Name)$lnkSuffix  [from repository]"
+                                        Path  = $rst
+                                    }
                                 }
                             }
                         }
@@ -1259,7 +1080,8 @@ if (Read-YesNo "Do you want to inject drivers into WinPE boot.wim?") {
             } else {
                 # Always go through the list so the user can confirm before injecting
                 Write-Host ""
-                Write-Log "$(if ($rstEntries.Count -eq 1) { 'Driver source found' } else { 'Multiple driver sources found' }) — select one to inject:" -Level Info
+                $driverMsg = if ($rstEntries.Count -eq 1) { 'Driver source found' } else { 'Multiple driver sources found' }
+                Write-Log "$driverMsg — select one to inject:" -Level Info
                 $selectedLabel = Select-FromList -Items ($rstEntries | Select-Object -ExpandProperty Label) `
                                                 -Prompt "Select driver source"
                 $selectedEntry = $rstEntries | Where-Object { $_.Label -eq $selectedLabel }

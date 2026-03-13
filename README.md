@@ -26,7 +26,7 @@ Rebuild a device from a vanilla Windows image downloaded from Microsoft, with ma
 
 **Steps:**
 
-1. **Download Windows ISO** from Microsoft and extract the `install.wim` from the `sources` folder
+1. **Download Windows ISO** from Microsoft, then run `ExtractWim.ps1` to extract the Pro edition into `Windows_WIM_Root` automatically — or extract `install.wim` manually from the `sources` folder of the ISO
 2. **Rename the WIM** to match the naming convention: `ModelName-OS.wim` (e.g., `B9450FA-OS.wim`)
 3. **Prepare drivers** from the manufacturer website:
    - Download driver packages for your model (Chipset, Graphics, Network, Audio, Storage, etc.)
@@ -136,20 +136,28 @@ Edit this file before each operation:
 | `targetScript` | Script to execute: `ApplyImage.bat` or `CaptureImage.bat` |
 | `DiskNumber` | Target disk number (use `diskpart` → `list disk` to find it) |
 | `BypassNRO` | Set to `1` to skip network requirement during OOBE (optional) |
+| `EditionIndex` | WIM edition index to apply (default `1`). Auto-set by `ProduceKey.ps1` when copying a multi-edition WIM. Use `dism /Get-ImageInfo /ImageFile:<wim>` to list available indices. |
 
 > [!WARNING]
 > If the ModelString doesn't match the device's SystemProductName, deployment will abort. This safety feature prevents accidental data loss. Always verify `DiskNumber` is correct - if the USB is disk 0, set `DiskNumber` to the internal disk number (often 1).
 
 ## config.psd1 (workstation - build-time paths)
 
-Edit before running ProduceKey:
+Edit before running any workstation script:
 
 ```powershell
 @{
-    "WinPE_WIM_Location" = "C:\Path\to\WinPE.wim"
+    "WinPE_WIM_Location"       = "C:\Path\to\WinPE.wim"
     "Device_Root_WIM_Location" = "C:\Path\to\ModelWIMs"
+    "Windows_WIM_Root"         = "C:\Path\to\WindowsWIMs"
 }
 ```
+
+| Key | Description |
+|-----|-------------|
+| `WinPE_WIM_Location` | Root directory of the WinPE library populated by `ExtractPE.ps1` (one subdirectory per Windows version, each containing a `boot.wim`) |
+| `Device_Root_WIM_Location` | Root of the model WIM library (one subdirectory per model) |
+| `Windows_WIM_Root` | Root of the vanilla Windows WIM library populated by `ExtractWim.ps1` (one subdirectory per Windows version) |
 
 # USB Key Generation
 
@@ -163,18 +171,109 @@ Edit before running ProduceKey:
 ## Running ProduceKey
 
 ```powershell
+# Interactive (no log file)
 .\ProduceKey.ps1
+
+# With log file
+.\ProduceKey.ps1 -Log
 ```
 
-The script guides you through:
-1. **Format USB** (optional) - Creates dual-partition structure
-2. **Apply WinPE** (optional) - Installs WinPE to boot partition
-3. **Copy scripts** - Copies deployment scripts to USB
-4. **Copy model WIMs** (optional) - Copies WIM files for a specific model
+The script guides you through five steps in order:
+
+| Step | Action | Notes |
+|------|--------|-------|
+| 1 | **Format USB** | Creates dual-partition structure (FAT32 WinPE + NTFS Images) |
+| 2 | **Apply WinPE** | Installs WinPE to the boot partition |
+| 3 | **Copy scripts** | Copies deployment scripts to the Images partition |
+| 4 | **Copy model WIMs** | Copies WIM files for a selected model; auto-detects Pro edition index and updates `config.ini` |
+| 5 | **Inject WinPE drivers** | Injects iRST/storage drivers into `boot.wim`; scans the key first, falls back to the WIM repository if no drivers are present |
 
 A safety marker file (`DEPLOYKEY.marker`) is created to prevent accidental USB formatting.
 
 Log file: `ProduceKey_YYYYMMDD_HHMMSS.log`
+
+# Workstation Tooling Scripts
+
+These scripts run on your workstation (not in WinPE) to build and maintain the WIM library used during key production. They all share a common module (`DeviceRebuild.psm1`) and read paths from `config.psd1`.
+
+## ExtractPE.ps1
+
+Extracts the WinPE boot image (index 1) from a Windows ISO and saves it as `boot.wim` in a version-named directory under `WinPE_WIM_Location`. No ADK required — uses only DISM which is built into Windows 10/11.
+
+```powershell
+# With ISO path as parameter
+.\ExtractPE.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso"
+
+# Without parameter — opens a file picker dialog
+.\ExtractPE.ps1
+
+# With log file
+.\ExtractPE.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso" -Log
+```
+
+**Output:** `<WinPE_WIM_Location>\<Version>\boot.wim`
+
+```
+C:\Scratch\WinPE\
+├── W11-24H2\
+│   └── boot.wim
+├── W11-25H2\
+│   └── boot.wim
+└── W10-22H2\
+    └── boot.wim
+```
+
+Version naming and build number detection work identically to `ExtractWim.ps1`. When you run `ProduceKey.ps1`, it lists all available WinPE versions at startup and asks you to pick one before proceeding.
+
+> [!NOTE]
+> The WinPE image extracted from a Windows ISO (index 1 of `sources\boot.wim`) contains all tools needed for deployment: DISM, diskpart, bcdboot, cmd, reg, xcopy. It is functionally equivalent to an ADK-built WinPE for this use case.
+
+## ExtractWim.ps1
+
+Extracts the **Pro** and **Pro Education** editions from a Windows ISO and saves them as a single version-named WIM file under `Windows_WIM_Root`.
+
+```powershell
+# With ISO path as parameter
+.\ExtractWim.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso"
+
+# Without parameter — opens a file picker dialog
+.\ExtractWim.ps1
+
+# With log file
+.\ExtractWim.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso" -Log
+```
+
+**Output:** `<Windows_WIM_Root>\<Version>\<Version>.wim`
+
+```
+C:\Scratch\WindowsWIMs\
+├── W11-24H2\
+│   └── W11-24H2.wim     (contains: Windows 11 Pro + Windows 11 Pro Education)
+├── W11-25H2\
+│   └── W11-25H2.wim
+└── W10-22H2\
+    └── W10-22H2.wim
+```
+
+The version name (`W11-24H2`, `W10-22H2`, etc.) is automatically detected from the ISO's build number. If the build is unknown, the script prompts you to enter the name manually.
+
+**Supported version detection:**
+
+| Build | Version name |
+|-------|-------------|
+| 19041–19045 | W10-2004 … W10-22H2 |
+| 22000 | W11-21H2 |
+| 22621 | W11-22H2 |
+| 22631 | W11-23H2 |
+| 26100 | W11-24H2 |
+| 26200 | W11-25H2 |
+| other | Prompts for name |
+
+> [!NOTE]
+> Both `install.wim` and `install.esd` ISOs are supported. `.esd` export is slower due to the encrypted compression format.
+
+> [!TIP]
+> The resulting WIM can be renamed to `ModelName-OS.wim` and placed in your `Device_Root_WIM_Location` model directory, then used by `ProduceKey.ps1` to populate a USB key. `ProduceKey.ps1` will automatically detect the Pro edition index during the WIM copy step.
 
 # WIM File Naming Convention
 
@@ -227,6 +326,62 @@ Device_Root_WIM_Location/
 > ModelString=B9450FA
 > ```
 > This lets you use a descriptive folder name (e.g., `ExpertBook B9`) while keeping the correct model string for deployment.
+
+## LNK Redirect System
+
+To avoid duplicating large WIM files across model directories, you can place marker files that redirect `ProduceKey.ps1` to a shared source. All files are renamed on the fly with the target model prefix when copied to the USB key.
+
+### Level 1 — Share WIMs between models
+
+Create an empty file named `LNK-<SourceModel>.txt` in the model directory. `ProduceKey.ps1` will pull all WIM files from the `<SourceModel>` directory, rename them with the target model prefix, and copy them to the USB key. The target model directory typically holds:
+
+- `LNK-<SourceModel>.txt` — redirect marker
+- `Drivers\` — model-specific drivers (always from here, never from the source)
+- `ModelA-SYSTEM.wim`, `ModelA-RECOVERY.wim`, `ModelA-MYASUS.wim` — partition WIMs that differ from the source (optional, copied as-is)
+
+```
+Device_Root_WIM_Location/
+├── B9450FA/
+│   ├── B9450FA-OS.wim         (self-contained with all WIMs)
+│   ├── B9450FA-RECOVERY.wim
+│   └── B9450FA-MYASUS.wim
+└── B5402CB/
+    ├── LNK-B9450FA.txt        (OS comes from B9450FA\)
+    ├── B5402CB-RECOVERY.wim   (model-specific partitions kept here)
+    ├── B5402CB-MYASUS.wim
+    └── Drivers\               (model-specific drivers)
+```
+
+When B5402CB is selected: `B9450FA-OS.wim` is copied as `B5402CB-OS.wim`.
+
+### Level 2 — Use vanilla Windows WIM as OS
+
+Create an empty file named `LNK-OS-<Version>.txt` inside the Level 1 source directory (e.g., `B9450FA\`). This further redirects the OS WIM to `Windows_WIM_Root\<Version>\<Version>.wim` (the output of `ExtractWim.ps1`).
+
+```
+Device_Root_WIM_Location/
+├── B9450FA/
+│   ├── LNK-OS-W11-25H2.txt   (OS from Windows_WIM_Root\W11-25H2\W11-25H2.wim)
+│   ├── B9450FA-RECOVERY.wim
+│   └── B9450FA-MYASUS.wim
+└── B5402CB/
+    ├── LNK-B9450FA.txt        (inherit from B9450FA, which itself uses W11-25H2)
+    ├── B5402CB-RECOVERY.wim
+    └── Drivers\
+
+Windows_WIM_Root/
+└── W11-25H2/
+    └── W11-25H2.wim           (Pro + Pro Education, output of ExtractWim.ps1)
+```
+
+When either model is selected, `W11-25H2.wim` is copied to the USB key as `<ModelString>-OS.wim`, and `ProduceKey.ps1` auto-detects the Pro edition index.
+
+| Scenario | OS source | Other WIMs |
+|----------|-----------|------------|
+| No LNK | Model dir | Model dir |
+| `LNK-<Src>.txt` only | `<Src>\` dir (renamed) | Model dir + `<Src>\` dir |
+| `LNK-OS-<Ver>.txt` only (in model dir) | `Windows_WIM_Root\<Ver>\` | Model dir |
+| `LNK-<Src>.txt` + `LNK-OS-<Ver>.txt` (in `<Src>\`) | `Windows_WIM_Root\<Ver>\` | Model dir + `<Src>\` dir (minus OS) |
 
 `ProduceKey.ps1` copies WIM files to the root of `I:\` and the `Drivers\` subfolder to `I:\Drivers\<ModelString>\` automatically.
 
@@ -324,18 +479,15 @@ Before executing the target script, startnet.cmd displays a summary and asks for
 
 # WinPE WIM Customization
 
-DeviceRebuild requires a WinPE (Windows Preinstallation Environment) WIM file to boot the USB key. This project cannot distribute the WIM file, but you can build one yourself using the Windows ADK.
+DeviceRebuild requires a WinPE (Windows Preinstallation Environment) WIM file to boot the USB key. Use `ExtractPE.ps1` to extract it directly from a Windows ISO — no ADK needed.
 
-## Building a WinPE WIM
+## Building the WinPE library
 
-1. **Install the Windows ADK** and the **WinPE add-on** from Microsoft
-2. **Open the Deployment and Imaging Tools Environment** as Administrator
-3. **Create a WinPE working directory:**
-   ```shell
-   copype amd64 C:\WinPE_amd64
-   ```
-4. The WinPE WIM is located at `C:\WinPE_amd64\media\sources\boot.wim`
-5. **Set `WinPE_WIM_Location`** in `config.psd1` to point to this file (or copy it to a permanent location first)
+```powershell
+.\ExtractPE.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso"
+```
+
+This populates `WinPE_WIM_Location` with a versioned `boot.wim`. Repeat for each Windows version you want to support. `ProduceKey.ps1` will list them at startup for selection.
 
 For complete instructions, see Microsoft's official documentation:
 [Create bootable WinPE media](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpe-create-usb-bootable-drive)
