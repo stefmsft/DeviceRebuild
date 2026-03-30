@@ -129,6 +129,51 @@ function Select-FromList {
     return $Items[$selectedNumber - 1]
 }
 
+function Select-MultiFromList {
+    <#
+    .SYNOPSIS
+        Presents a toggleable checklist. Returns array of selected items.
+        Type a number to toggle that item on/off. Press Enter with no input to confirm.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Items,
+        [string]$Prompt = "Toggle (number) or Enter to confirm"
+    )
+
+    $selected = @($false) * $Items.Length
+
+    while ($true) {
+        Write-Host ""
+        for ($i = 0; $i -lt $Items.Length; $i++) {
+            $mark = if ($selected[$i]) { 'x' } else { ' ' }
+            Write-Host "  [$mark] " -NoNewline -ForegroundColor Cyan
+            Write-Host "$($i + 1). $($Items[$i])"
+        }
+        Write-Host ""
+        Write-Host "$Prompt (1-$($Items.Length), A=all, Enter to confirm): " -NoNewline -ForegroundColor Yellow
+        $input = Read-Host
+
+        if ([string]::IsNullOrWhiteSpace($input)) { break }
+
+        if ($input.Trim() -ieq 'A') {
+            for ($i = 0; $i -lt $Items.Length; $i++) { $selected[$i] = $true }
+            continue
+        }
+
+        $num = $input.Trim() -as [int]
+        if ($num -ge 1 -and $num -le $Items.Length) {
+            $selected[$num - 1] = -not $selected[$num - 1]
+        }
+    }
+
+    $result = @()
+    for ($i = 0; $i -lt $Items.Length; $i++) {
+        if ($selected[$i]) { $result += $Items[$i] }
+    }
+    return $result
+}
+
 # ============================================================
 # USB Drive Helpers
 # ============================================================
@@ -512,5 +557,99 @@ function Copy-FileWithProgress {
     finally {
         $src.Close()
         $dst.Close()
+    }
+}
+
+# ============================================================
+# WinPE helpers
+# ============================================================
+function Update-StartnetCmd {
+    <#
+    .SYNOPSIS
+        Injects the current Scripts\startnet.cmd into the boot.wim on a WinPE partition.
+        Used by both ProduceKey.ps1 and CreatePE.ps1.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$WinPEDriveLetter
+    )
+
+    $bootWim       = Join-Path $WinPEDriveLetter "sources\boot.wim"
+    $startnetSource = Join-Path $PSScriptRoot "Scripts\startnet.cmd"
+    $mountDir      = "C:\WinPE_Mount"
+
+    if (-not (Test-Path $bootWim)) {
+        Write-Log "boot.wim not found at: $bootWim" -Level Error
+        return $false
+    }
+
+    if (-not (Test-Path $startnetSource)) {
+        Write-Log "startnet.cmd not found at: $startnetSource" -Level Error
+        return $false
+    }
+
+    if (Test-Path $mountDir) {
+        $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
+        $ProgressPreference = $p
+    }
+    New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
+
+    Remove-StaleWimMount -WimFilePath $bootWim | Out-Null
+
+    try {
+        Write-Log "Mounting boot.wim to inject startnet.cmd..." -Level Info
+        Write-Host ""
+        & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
+        $dismExitCode = $LASTEXITCODE
+
+        if ($dismExitCode -ne 0) {
+            Write-Log "Mount failed (exit code: $dismExitCode) — attempting stale mount recovery..." -Level Warning
+            if (Remove-StaleWimMount -WimFilePath $bootWim) {
+                Write-Log "Retrying mount..." -Level Info
+                if (Test-Path $mountDir) {
+                    $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+                    Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue
+                    $ProgressPreference = $p
+                }
+                New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
+                Write-Host ""
+                & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
+                $dismExitCode = $LASTEXITCODE
+            }
+        }
+
+        if ($dismExitCode -ne 0) {
+            Write-Log "Failed to mount boot.wim (exit code: $dismExitCode)" -Level Error
+            return $false
+        }
+
+        $startnetDest = Join-Path $mountDir "Windows\System32\startnet.cmd"
+        Copy-Item -Path $startnetSource -Destination $startnetDest -Force
+        Write-Log "startnet.cmd copied into WinPE image." -Level Success
+
+        Write-Log "Committing boot.wim..." -Level Info
+        Write-Host ""
+        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Commit
+        $dismExitCode = $LASTEXITCODE
+
+        if ($dismExitCode -ne 0) {
+            Write-Log "Failed to commit boot.wim (exit code: $dismExitCode)" -Level Error
+            & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
+            return $false
+        }
+
+        Write-Log "startnet.cmd updated in WinPE successfully." -Level Success
+        return $true
+    }
+    catch {
+        Write-Log "Error updating startnet.cmd: $_" -Level Error
+        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
+        return $false
+    }
+    finally {
+        if ((Test-Path $mountDir) -and ((Get-ChildItem $mountDir -Force | Measure-Object).Count -eq 0)) {
+            Remove-Item $mountDir -Force -ErrorAction SilentlyContinue
+        }
     }
 }

@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     ProduceKey.ps1 - USB Key Creation Tool for Windows Device Imaging
@@ -231,206 +231,6 @@ DEPLOYKEY_MARKER=TRUE
     }
 }
 
-function Update-StartnetCmd {
-    <#
-    .SYNOPSIS
-        Injects the current startnet.cmd into the WinPE boot.wim
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [string]$WinPEDriveLetter
-    )
-
-    $bootWim = Join-Path $WinPEDriveLetter "sources\boot.wim"
-    $startnetSource = Join-Path $PSScriptRoot "Scripts\startnet.cmd"
-    $mountDir = "C:\WinPE_Mount"
-
-    if (-not (Test-Path $bootWim)) {
-        Write-Log "boot.wim not found at: $bootWim" -Level Error
-        return $false
-    }
-
-    if (-not (Test-Path $startnetSource)) {
-        Write-Log "startnet.cmd not found at: $startnetSource" -Level Error
-        return $false
-    }
-
-    # Clean up and create mount directory
-    if (Test-Path $mountDir) {
-        $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
-        $ProgressPreference = $p
-    }
-    New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
-
-    # Proactive stale mount cleanup before attempting mount
-    Remove-StaleWimMount -WimFilePath $bootWim | Out-Null
-
-    try {
-        # Mount boot.wim — use call operator to avoid Start-Process -Wait hanging
-        # on DismHost.exe child processes that outlive dism.exe itself
-        Write-Log "Mounting boot.wim to inject startnet.cmd..." -Level Info
-        Write-Host ""
-        & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
-        $dismExitCode = $LASTEXITCODE
-
-        if ($dismExitCode -ne 0) {
-            Write-Log "Mount failed (exit code: $dismExitCode) — attempting stale mount recovery..." -Level Warning
-            if (Remove-StaleWimMount -WimFilePath $bootWim) {
-                Write-Log "Retrying mount..." -Level Info
-                if (Test-Path $mountDir) { $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'; Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue; $ProgressPreference = $p }
-                New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
-                Write-Host ""
-                & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
-                $dismExitCode = $LASTEXITCODE
-            }
-        }
-
-        if ($dismExitCode -ne 0) {
-            Write-Log "Failed to mount boot.wim (exit code: $dismExitCode)" -Level Error
-            return $false
-        }
-
-        # Copy startnet.cmd into the mounted image
-        $startnetDest = Join-Path $mountDir "Windows\System32\startnet.cmd"
-        Copy-Item -Path $startnetSource -Destination $startnetDest -Force
-        Write-Log "startnet.cmd copied into WinPE image." -Level Success
-
-        # Unmount and commit
-        Write-Log "Committing boot.wim..." -Level Info
-        Write-Host ""
-        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Commit
-        $dismExitCode = $LASTEXITCODE
-
-        if ($dismExitCode -ne 0) {
-            Write-Log "Failed to commit boot.wim (exit code: $dismExitCode)" -Level Error
-            & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
-            return $false
-        }
-
-        Write-Log "startnet.cmd updated in WinPE successfully." -Level Success
-        return $true
-    }
-    catch {
-        Write-Log "Error updating startnet.cmd: $_" -Level Error
-        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
-        return $false
-    }
-    finally {
-        if ((Test-Path $mountDir) -and ((Get-ChildItem $mountDir -Force | Measure-Object).Count -eq 0)) {
-            Remove-Item $mountDir -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Add-WinPEDrivers {
-    <#
-    .SYNOPSIS
-        Injects drivers into WinPE boot.wim
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [string]$WinPEDriveLetter,
-
-        [Parameter(Mandatory)]
-        [string]$DriverPath
-    )
-
-    Write-Section "Inject Drivers into WinPE"
-
-    $bootWim = Join-Path $WinPEDriveLetter "sources\boot.wim"
-    $mountDir = "C:\WinPE_Mount"
-
-    # Validate boot.wim exists
-    if (-not (Test-Path $bootWim)) {
-        Write-Log "boot.wim not found at: $bootWim" -Level Error
-        return $false
-    }
-
-    # Validate driver path exists
-    if (-not (Test-Path $DriverPath -PathType Container)) {
-        Write-Log "Driver path not found: $DriverPath" -Level Error
-        return $false
-    }
-
-    # Always clean up stale mounts first — covers re-runs after Ctrl-C
-    Remove-StaleWimMount -WimFilePath $bootWim | Out-Null
-
-    # Clean and recreate mount directory
-    if (Test-Path $mountDir) {
-        $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Remove-Item -Path $mountDir -Recurse -Force -ErrorAction SilentlyContinue
-        $ProgressPreference = $p
-    }
-    New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
-
-    try {
-        # Mount boot.wim — use call operator to avoid Start-Process -Wait hanging
-        # on DismHost.exe child processes that outlive dism.exe itself
-        Write-Log "Mounting boot.wim..." -Level Info
-        Write-Host ""
-        & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
-        $dismExitCode = $LASTEXITCODE
-
-        if ($dismExitCode -ne 0) {
-            # Fallback stale-mount recovery (e.g. drive letter changed between sessions)
-            Write-Log "Mount failed (exit code: $dismExitCode) — attempting stale mount recovery..." -Level Warning
-            if (Remove-StaleWimMount -WimFilePath $bootWim) {
-                Write-Log "Retrying mount..." -Level Info
-                if (Test-Path $mountDir) { $p = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'; Remove-Item $mountDir -Recurse -Force -ErrorAction SilentlyContinue; $ProgressPreference = $p }
-                New-Item -Path $mountDir -ItemType Directory -Force | Out-Null
-                Write-Host ""
-                & dism.exe /Mount-Image "/ImageFile:$bootWim" /Index:1 "/MountDir:$mountDir"
-                $dismExitCode = $LASTEXITCODE
-            }
-        }
-
-        if ($dismExitCode -ne 0) {
-            Write-Log "Failed to mount boot.wim (exit code: $dismExitCode)" -Level Error
-            return $false
-        }
-
-        Write-Log "boot.wim mounted successfully." -Level Success
-
-        # Inject drivers — RST/storage drivers can take several minutes, this is normal
-        Write-Log "Injecting drivers from: $DriverPath" -Level Info
-        Write-Log "(Driver injection may take several minutes — please wait)" -Level Warning
-        Write-Host ""
-        & dism.exe /Image:"$mountDir" /Add-Driver "/Driver:$DriverPath" /Recurse
-        $dismExitCode = $LASTEXITCODE
-
-        if ($dismExitCode -ne 0) {
-            Write-Log "Warning: Some drivers may have failed to inject (exit code: $dismExitCode)" -Level Warning
-        } else {
-            Write-Log "Drivers injected successfully." -Level Success
-        }
-
-        # Unmount and commit
-        Write-Log "Unmounting and committing changes..." -Level Info
-        Write-Host ""
-        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Commit
-        $dismExitCode = $LASTEXITCODE
-
-        if ($dismExitCode -ne 0) {
-            Write-Log "Failed to unmount boot.wim (exit code: $dismExitCode)" -Level Error
-            & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
-            return $false
-        }
-
-        Write-Log "WinPE drivers injected and saved successfully." -Level Success
-        return $true
-    }
-    catch {
-        Write-Log "Error injecting drivers: $_" -Level Error
-        & dism.exe /Unmount-Image "/MountDir:$mountDir" /Discard | Out-Null
-        return $false
-    }
-    finally {
-        if ((Test-Path $mountDir) -and ((Get-ChildItem $mountDir -Force | Measure-Object).Count -eq 0)) {
-            Remove-Item $mountDir -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
 
 function Copy-ScriptFiles {
     <#
@@ -901,7 +701,7 @@ $peWimValid = $false
 
 if (-not (Test-Path $PE_WIM_ROOT -PathType Container)) {
     Write-Log "WinPE directory not found: $PE_WIM_ROOT" -Level Warning
-    Write-Log "Run ExtractPE.ps1 to populate this directory." -Level Warning
+    Write-Log "Run CreatePE.ps1 to populate this directory." -Level Warning
 } else {
     $peEntries = @(Get-ChildItem -Path $PE_WIM_ROOT -Directory |
                    Where-Object { Test-Path (Join-Path $_.FullName "boot.wim") } |
@@ -909,7 +709,7 @@ if (-not (Test-Path $PE_WIM_ROOT -PathType Container)) {
 
     if ($peEntries.Count -eq 0) {
         Write-Log "No boot.wim found in any subdirectory of: $PE_WIM_ROOT" -Level Warning
-        Write-Log "Run ExtractPE.ps1 to populate this directory." -Level Warning
+        Write-Log "Run CreatePE.ps1 to populate this directory." -Level Warning
     } else {
         $selectedLabel = Select-FromList -Items ($peEntries | Select-Object -ExpandProperty Label) `
                                          -Prompt "Select WinPE version to use"
@@ -964,9 +764,39 @@ if (Read-YesNo "Do you want to format a USB drive?") {
 }
 
 # ============================================================
-# Step 3: Copy Script Files (Optional)
+# Step 3: Update startnet.cmd Only (Optional)
 # ============================================================
-Write-Section "Step 3: Copy Script Files (Optional)"
+Write-Section "Step 3: Update startnet.cmd (Optional)"
+
+Write-Host ""
+Write-Log "Updates only the startnet.cmd inside boot.wim on an existing WinPE partition." -Level Info
+Write-Log "Use this when WinPE is already applied and you only want to refresh the boot script." -Level Info
+Write-Host ""
+
+if (Read-YesNo "Update startnet.cmd on an existing WinPE partition?") {
+    $startnetDrive = $winPEDrive
+
+    if (-not $startnetDrive) {
+        Write-Host ""
+        Write-Log "Select the WinPE partition (FAT32 partition with sources\boot.wim):" -Level Info
+        $selectedDrive = Select-DriveLetter -Purpose "WinPE partition"
+        if ($selectedDrive) { $startnetDrive = $selectedDrive.DriveLetter }
+    }
+
+    if (-not $startnetDrive) {
+        Write-Log "No WinPE partition selected. Skipping." -Level Warning
+    } else {
+        $ok = Update-StartnetCmd -WinPEDriveLetter $startnetDrive
+        if (-not $ok) {
+            Write-Log "startnet.cmd update failed." -Level Warning
+        }
+    }
+}
+
+# ============================================================
+# Step 4: Copy Script Files (Optional)
+# ============================================================
+Write-Section "Step 4: Copy Script Files (Optional)"
 
 if (Read-YesNo "Do you want to copy deployment scripts to USB?") {
     Write-Host ""
@@ -983,9 +813,9 @@ if (Read-YesNo "Do you want to copy deployment scripts to USB?") {
 }
 
 # ============================================================
-# Step 4: Copy Model WIMs (Optional)
+# Step 5: Copy Model WIMs (Optional)
 # ============================================================
-Write-Section "Step 4: Copy Model WIMs (Optional)"
+Write-Section "Step 5: Copy Model WIMs (Optional)"
 
 if (Read-YesNo "Do you want to copy model WIM files to USB?") {
 
@@ -1002,96 +832,6 @@ if (Read-YesNo "Do you want to copy model WIM files to USB?") {
         Write-Log "Please update Device_Root_WIM_Location in config.psd1" -Level Warning
     } else {
         Copy-ModelWIMs -DriveLetter $imagesDrive -WimSourceDirectory $DEV_ROOT_WIM -WinWimRoot $WIN_WIM_ROOT -SharedDriversLocation $SHARED_DRV_ROOT
-    }
-}
-
-# ============================================================
-# Step 5: Inject Drivers into WinPE (Optional)
-# ============================================================
-Write-Section "Step 5: Inject Drivers into WinPE (Optional)"
-
-Write-Host ""
-Write-Log "Inject storage drivers (e.g., Intel RST) into WinPE to enable disk detection." -Level Info
-Write-Host ""
-
-if (Read-YesNo "Do you want to inject drivers into WinPE boot.wim?") {
-
-    # Get WinPE partition if not already known
-    if (-not $winPEDrive) {
-        Write-Host ""
-        Write-Log "Select the WinPE partition (FAT32 partition with sources\boot.wim):" -Level Info
-        $selectedPE = Select-DriveLetter -Purpose "WinPE partition"
-        if ($selectedPE) { $winPEDrive = $selectedPE.DriveLetter }
-    }
-
-    if (-not $winPEDrive) {
-        Write-Log "No WinPE partition selected. Skipping." -Level Warning
-    } else {
-        $bootWimPath = Join-Path $winPEDrive "sources\boot.wim"
-        if (-not (Test-Path $bootWimPath)) {
-            Write-Log "boot.wim not found at $bootWimPath - is this the correct WinPE partition?" -Level Error
-        } else {
-
-            # --- Discover RST driver sources ---
-            $rstEntries = @()
-
-            # 1. Check drivers already on the images drive (copied by Step 4)
-            if ($imagesDrive) {
-                $driversRoot = Join-Path $imagesDrive "Drivers"
-                if (Test-Path $driversRoot -PathType Container) {
-                    foreach ($modelDir in (Get-ChildItem $driversRoot -Directory)) {
-                        $rst = Find-RSTDriverPath -DriverDir $modelDir.FullName
-                        if ($rst) {
-                            $rstEntries += [PSCustomObject]@{
-                                Label = "$($modelDir.Name)  [on key: $imagesDrive]"
-                                Path  = $rst
-                            }
-                        }
-                    }
-                }
-            }
-
-            # 2. Nothing on the key — scan the WIM repository for models with Drivers\
-            if ($rstEntries.Count -eq 0) {
-                if (Test-Path $DEV_ROOT_WIM -PathType Container) {
-                    Write-Log "No drivers found on key — scanning WIM repository for driver sources..." -Level Info
-                    foreach ($dir in (Get-ChildItem $DEV_ROOT_WIM -Directory)) {
-                        $srcDriverDir = Join-Path $dir.FullName "Drivers"
-                        if (Test-Path $srcDriverDir -PathType Container) {
-                            $driverResolved = Resolve-DriverLnk -DriversDir $srcDriverDir -SharedDriversLocation $SHARED_DRV_ROOT
-                            if ($driverResolved) {
-                                $rst = Find-RSTDriverPath -DriverDir $driverResolved.Path
-                                if ($rst) {
-                                    $lnkSuffix = if ($driverResolved.LinkedModel) { "  [->$($driverResolved.LinkedModel)]" } else { '' }
-                                    $rstEntries += [PSCustomObject]@{
-                                        Label = "$($dir.Name)$lnkSuffix  [from repository]"
-                                        Path  = $rst
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if ($rstEntries.Count -eq 0) {
-                Write-Log "No RST/storage driver sources found. Skipping." -Level Warning
-                Write-Log "Expected structure: <Images>:\Drivers\<Model>\Rapid Storage\  or  <WIM repo>\<Model>\Drivers\Rapid Storage\" -Level Warning
-            } else {
-                # Always go through the list so the user can confirm before injecting
-                Write-Host ""
-                $driverMsg = if ($rstEntries.Count -eq 1) { 'Driver source found' } else { 'Multiple driver sources found' }
-                Write-Log "$driverMsg — select one to inject:" -Level Info
-                $selectedLabel = Select-FromList -Items ($rstEntries | Select-Object -ExpandProperty Label) `
-                                                -Prompt "Select driver source"
-                $selectedEntry = $rstEntries | Where-Object { $_.Label -eq $selectedLabel }
-
-                if ($selectedEntry) {
-                    Write-Log "Using driver path: $($selectedEntry.Path)" -Level Info
-                    Add-WinPEDrivers -WinPEDriveLetter $winPEDrive -DriverPath $selectedEntry.Path
-                }
-            }
-        }
     }
 }
 

@@ -126,7 +126,7 @@ if /i not "%checkString%"=="%systemProductName%" (
 			%%D:
 			cd %targetDirScript%
 			set "DiskNumber=%DiskNumber%"
-			%targetScript% "%ModelString%"
+			call %targetScript% "%ModelString%"
 			call :log "============================================================"
 			call :log "%targetScript% completed."
 			call :log "System will shut down in 5 seconds..."

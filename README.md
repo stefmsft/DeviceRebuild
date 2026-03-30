@@ -155,7 +155,7 @@ Edit before running any workstation script:
 
 | Key | Description |
 |-----|-------------|
-| `WinPE_WIM_Location` | Root directory of the WinPE library populated by `ExtractPE.ps1` (one subdirectory per Windows version, each containing a `boot.wim`) |
+| `WinPE_WIM_Location` | Root directory of the WinPE library populated by `CreatePE.ps1` (one subdirectory per version/custom build, each containing a `boot.wim`) |
 | `Device_Root_WIM_Location` | Root of the model WIM library (one subdirectory per model) |
 | `Windows_WIM_Root` | Root of the vanilla Windows WIM library populated by `ExtractWim.ps1` (one subdirectory per Windows version) |
 
@@ -178,55 +178,26 @@ Edit before running any workstation script:
 .\ProduceKey.ps1 -Log
 ```
 
-The script guides you through five steps in order:
+The script guides you through five steps in order. Each step is optional — you can skip steps you don't need:
 
 | Step | Action | Notes |
 |------|--------|-------|
-| 1 | **Format USB** | Creates dual-partition structure (FAT32 WinPE + NTFS Images) |
-| 2 | **Apply WinPE** | Installs WinPE to the boot partition |
-| 3 | **Copy scripts** | Copies deployment scripts to the Images partition |
-| 4 | **Copy model WIMs** | Copies WIM files for a selected model; auto-detects Pro edition index and updates `config.ini` |
-| 5 | **Inject WinPE drivers** | Injects iRST/storage drivers into `boot.wim`; scans the key first, falls back to the WIM repository if no drivers are present |
+| 1 | **Format USB** | Creates dual-partition structure (FAT32 WinPE + NTFS Images) and optionally applies WinPE |
+| 2 | **Apply WinPE** | Applies a PE from the library to an existing partition (if Step 1 was skipped) |
+| 3 | **Update startnet.cmd** | Refreshes only `startnet.cmd` inside `boot.wim` on an existing WinPE partition — without re-applying the whole image |
+| 4 | **Copy scripts** | Copies deployment scripts (`ApplyImage.bat`, `CaptureImage.bat`, `config.ini`, etc.) to the Images partition |
+| 5 | **Copy model WIMs** | Copies WIM files for a selected model; auto-detects Pro edition index and updates `config.ini` |
 
 A safety marker file (`DEPLOYKEY.marker`) is created to prevent accidental USB formatting.
+
+> [!NOTE]
+> PE driver injection (storage/NVMe drivers) is managed separately by `CreatePE.ps1` via the `PEDrivers\` folder. Inject drivers into the WinPE image before adding it to the library, not after applying it to a USB key.
 
 Log file: `ProduceKey_YYYYMMDD_HHMMSS.log`
 
 # Workstation Tooling Scripts
 
 These scripts run on your workstation (not in WinPE) to build and maintain the WIM library used during key production. They all share a common module (`DeviceRebuild.psm1`) and read paths from `config.psd1`.
-
-## ExtractPE.ps1
-
-Extracts the WinPE boot image (index 1) from a Windows ISO and saves it as `boot.wim` in a version-named directory under `WinPE_WIM_Location`. No ADK required — uses only DISM which is built into Windows 10/11.
-
-```powershell
-# With ISO path as parameter
-.\ExtractPE.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso"
-
-# Without parameter — opens a file picker dialog
-.\ExtractPE.ps1
-
-# With log file
-.\ExtractPE.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso" -Log
-```
-
-**Output:** `<WinPE_WIM_Location>\<Version>\boot.wim`
-
-```
-C:\Scratch\WinPE\
-├── W11-24H2\
-│   └── boot.wim
-├── W11-25H2\
-│   └── boot.wim
-└── W10-22H2\
-    └── boot.wim
-```
-
-Version naming and build number detection work identically to `ExtractWim.ps1`. When you run `ProduceKey.ps1`, it lists all available WinPE versions at startup and asks you to pick one before proceeding.
-
-> [!NOTE]
-> The WinPE image extracted from a Windows ISO (index 1 of `sources\boot.wim`) contains all tools needed for deployment: DISM, diskpart, bcdboot, cmd, reg, xcopy. It is functionally equivalent to an ADK-built WinPE for this use case.
 
 ## ExtractWim.ps1
 
@@ -479,44 +450,80 @@ Before executing the target script, startnet.cmd displays a summary and asks for
 
 # WinPE WIM Customization
 
-DeviceRebuild requires a WinPE (Windows Preinstallation Environment) WIM file to boot the USB key. Use `ExtractPE.ps1` to extract it directly from a Windows ISO — no ADK needed.
+DeviceRebuild requires a WinPE (Windows Preinstallation Environment) WIM file to boot the USB key. 
 
-## Building the WinPE library
+- **`CreatePE.ps1`** — builds a fully customized WinPE using the Windows ADK. Supports PE driver injection, keyboard layout, PowerShell, and manual customization.
+
+## Building a customized WinPE with CreatePE
+
+`CreatePE.ps1` requires the Windows ADK + WinPE Add-on and operates in two independent phases:
 
 ```powershell
-.\ExtractPE.ps1 -IsoPath "C:\ISOs\Win11_24H2.iso"
-```
-
-This populates `WinPE_WIM_Location` with a versioned `boot.wim`. Repeat for each Windows version you want to support. `ProduceKey.ps1` will list them at startup for selection.
-
-For complete instructions, see Microsoft's official documentation:
-[Create bootable WinPE media](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpe-create-usb-bootable-drive)
-
-## Manual Updating startnet.cmd on Existing USB
-
-To manually replace the startnet.cmd inside the WinPE WIM on an already-built USB key:
-
-```shell
-# Mount the WinPE WIM from the USB boot partition
-Dism /Mount-Image /ImageFile:"P:\sources\boot.wim" /index:1 /MountDir:"C:\WinPE_mount"
-
-# Copy the updated startnet.cmd from this repo
-copy Scripts\startnet.cmd "C:\WinPE_mount\Windows\System32\startnet.cmd"
-
-# Unmount and commit changes
-Dism /Unmount-Image /MountDir:"C:\WinPE_mount" /commit
-```
-
-## Automatic Update startnet.cmd on Existing USB
-
-Use the helper script to automate the steps above:
-
-```shell
 # Run as Administrator
+.\CreatePE.ps1
+```
+
+**Phase A — Build PE WIM** (no USB required):
+1. Select or create an output directory in the PE library
+2. `copype` creates a fresh WinPE staging environment
+3. Inject PE drivers from `PEDrivers\` (optional, multi-select)
+4. Set keyboard layout, add PowerShell support, pause for manual edits
+5. Capture result as `boot.wim` in the PE library
+
+**Phase B — Apply PE to USB** (optional, runs after Phase A or standalone):
+- Picks any `boot.wim` from the PE library
+- Applies it to a USB WinPE partition using DISM
+- Injects the latest `startnet.cmd` automatically
+
+> [!NOTE]
+> Phase A and Phase B are fully independent. You can build a PE without any USB connected, then apply it later. You can also apply an existing PE from the library without rebuilding.
+
+## Injecting drivers into WinPE (PEDrivers)
+
+To inject storage, NVMe, or other drivers into WinPE at build time, create a `PEDrivers\` folder next to the PE library root (`WinPE_WIM_Location`):
+
+```
+<WinPE_WIM_Location>\
+├── PEDrivers\               <- driver packages for WinPE injection
+│   ├── IntelRST\            <- one subfolder per driver package
+│   │   └── *.inf
+│   ├── Chipset\
+│   │   └── *.inf
+│   └── NetworkDriver\
+│       └── *.inf
+├── W11-24H2\
+│   └── boot.wim
+└── CustomPE\
+    └── boot.wim
+```
+
+When `CreatePE.ps1` runs Phase A, it detects all subfolders in `PEDrivers\` and presents a toggleable checklist. Type a number to toggle a package on/off, `A` to select all, then press Enter to confirm.
+
+> [!TIP]
+> For NVMe/RAID devices (e.g., Intel RST), inject the storage driver here so WinPE can detect the internal disk. This replaces the old per-model driver scanning that was previously done at USB production time.
+
+## Updating startnet.cmd on an existing USB
+
+**Via ProduceKey.ps1** (Step 3 — recommended):
+```powershell
+.\ProduceKey.ps1
+# Choose "N" to skip format, "N" to skip WinPE apply, "Y" to update startnet.cmd
+# Select the WinPE partition (e.g. P:)
+```
+
+**Via batch script** (manual):
+```shell
 Scripts\UpdateStartnet.bat P
 ```
 
 Where `P` is the WinPE partition drive letter.
+
+**Manual DISM** (advanced):
+```shell
+Dism /Mount-Image /ImageFile:"P:\sources\boot.wim" /index:1 /MountDir:"C:\WinPE_mount"
+copy Scripts\startnet.cmd "C:\WinPE_mount\Windows\System32\startnet.cmd"
+Dism /Unmount-Image /MountDir:"C:\WinPE_mount" /commit
+```
 
 # Troubleshooting
 
