@@ -199,6 +199,39 @@ Log file: `ProduceKey_YYYYMMDD_HHMMSS.log`
 
 These scripts run on your workstation (not in WinPE) to build and maintain the WIM library used during key production. They all share a common module (`DeviceRebuild.psm1`) and read paths from `config.psd1`.
 
+## GetDriver.ps1
+
+Automated downloader for **SCCM Driver Packages** from the ASUS Support site. It resolves the model name, fetches the driver list via the ASUS API, and handles download and extraction.
+
+```powershell
+# Interactive
+.\GetDriver.ps1 -Model "BM1403CDA"
+
+# Automated download and expand
+.\GetDriver.ps1 -Model "BM1403CDA" -OSVersion "WIN11_25H2" -AutoExpand $true
+
+# Get latest version info as JSON
+.\GetDriver.ps1 -Model "BM1403CDA" -GetLatestVersion
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `-Model` | Device model name (e.g., `BM1403` or `BM1403CDA`) |
+| `-OSVersion` | Target OS version string (e.g., `WIN11_25H2`). Defaults to `25H2` |
+| `-Version` | Specific version string (e.g., `01.00`) to download |
+| `-Destination` | Directory to save the download. Defaults to current directory |
+| `-AutoExpand` | If set (`$true` or `$false`), runs non-interactively. If `$true`, extracts and deletes the ZIP |
+| `-GetLatestVersion` | Returns a JSON object with `{Version, OSVersion}` and exits |
+
+**Automated Workflow Example:**
+```powershell
+# 1. Get latest info
+$info = .\GetDriver.ps1 -Model BM1403CDA -GetLatestVersion | ConvertFrom-Json
+
+# 2. Download and expand using that exact info
+.\GetDriver.ps1 -Model BM1403CDA -Version $info.Version -OSVersion $info.OSVersion -AutoExpand $true
+```
+
 ## ExtractWim.ps1
 
 Extracts the **Pro** and **Pro Education** editions from a Windows ISO and saves them as a single version-named WIM file under `Windows_WIM_Root`.
