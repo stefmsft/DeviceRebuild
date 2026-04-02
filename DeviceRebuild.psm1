@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    DeviceRebuild shared module — utility functions used by ProduceKey.ps1,
+    DeviceRebuild shared module ??? utility functions used by ProduceKey.ps1,
     ExtractWim.ps1, and future tooling scripts.
 #>
 
 # ============================================================
-# Module-scope logging state — set by the calling script via Initialize-Logging
+# Module-scope logging state ??? set by the calling script via Initialize-Logging
 # ============================================================
 $Script:LogEnabled = $false
 $Script:LogFile    = $null
@@ -362,7 +362,7 @@ function Remove-StaleWimMount {
             if ($p.ExitCode -eq 0) {
                 Write-Log "Stale mount discarded." -Level Success
             } else {
-                Write-Log "Failed to discard stale mount (exit code: $($p.ExitCode)) — forcing Cleanup-Wim." -Level Warning
+                Write-Log "Failed to discard stale mount (exit code: $($p.ExitCode)) ??? forcing Cleanup-Wim." -Level Warning
             }
             $cleaned = $true
         }
@@ -604,7 +604,7 @@ function Update-StartnetCmd {
         $dismExitCode = $LASTEXITCODE
 
         if ($dismExitCode -ne 0) {
-            Write-Log "Mount failed (exit code: $dismExitCode) — attempting stale mount recovery..." -Level Warning
+            Write-Log "Mount failed (exit code: $dismExitCode) ??? attempting stale mount recovery..." -Level Warning
             if (Remove-StaleWimMount -WimFilePath $bootWim) {
                 Write-Log "Retrying mount..." -Level Info
                 if (Test-Path $mountDir) {
@@ -653,3 +653,5 @@ function Update-StartnetCmd {
         }
     }
 }
+
+
