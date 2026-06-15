@@ -132,6 +132,37 @@ rem ============================================================
 call :log ""
 call :log "[3/12] Creating partitions on Disk %DiskNumber%..."
 
+rem -- Determine Recovery partition size from RECOVERY.wim if present
+set "RECOVERY_SIZE=2500"
+set /a "SHRINK_SIZE=RECOVERY_SIZE + 500"
+
+if exist "%MODEL%-RECOVERY.wim" (
+    call :log "      Found %MODEL%-RECOVERY.wim, estimating expanded size..."
+    dism /Get-WimInfo /WimFile:"%MODEL%-RECOVERY.wim" > TempWimInfo.txt 2>&1
+    set "WIM_SIZE_RAW="
+    for /f "tokens=1,2,3" %%A in (TempWimInfo.txt) do (
+        if /i "%%A"=="Size" if "%%B"==":" if not defined WIM_SIZE_RAW set "WIM_SIZE_RAW=%%C"
+    )
+    del TempWimInfo.txt 2>nul
+    if defined WIM_SIZE_RAW (
+        set "CLEAN=!WIM_SIZE_RAW:,=!"
+        set "SIZE_MB=!CLEAN:~0,-6!"
+        if "!SIZE_MB!"=="" set "SIZE_MB=0"
+        set /a "RECOVERY_SIZE=!SIZE_MB! + 500"
+        set /a "SHRINK_SIZE=RECOVERY_SIZE + 500"
+        call :log "      WIM expanded: ~!SIZE_MB! MB  ->  Recovery: !RECOVERY_SIZE! MB  /  Windows shrink: !SHRINK_SIZE! MB"
+    ) else (
+        call :log "      Could not parse WIM info -> Recovery: !RECOVERY_SIZE! MB  /  Windows shrink: !SHRINK_SIZE! MB (defaults)"
+    )
+) else (
+    call :log "      No %MODEL%-RECOVERY.wim found -> Recovery: !RECOVERY_SIZE! MB  /  Windows shrink: !SHRINK_SIZE! MB (defaults)"
+)
+
+echo. > CON
+echo   Recovery partition : !RECOVERY_SIZE! MB > CON
+echo   Windows shrink     : !SHRINK_SIZE! MB > CON
+echo. > CON
+
 rem Generate dynamic partition script with configured disk number
 (
     echo select disk %DiskNumber%
@@ -145,11 +176,11 @@ rem Generate dynamic partition script with configured disk number
     echo create partition msr size=16
     echo rem == 3. Windows partition ========================
     echo create partition primary
-    echo shrink minimum=2500
+    echo shrink minimum=!SHRINK_SIZE!
     echo format quick fs=ntfs label="Windows"
     echo assign letter="W"
     echo rem == 4. Recovery partition ======================
-    echo create partition primary size=2000
+    echo create partition primary size=!RECOVERY_SIZE!
     echo format quick fs=ntfs label="Recovery"
     echo assign letter="R"
     echo set id="de94bba4-06d1-4d40-a16a-bfd50179d6ac"
@@ -394,10 +425,10 @@ call :log "      Creating ReCreatePartitions-UEFI.txt..."
     echo assign letter="S"
     echo create partition msr size=16
     echo create partition primary
-    echo shrink minimum=2500
+    echo shrink minimum=!SHRINK_SIZE!
     echo format quick fs=ntfs label="Windows"
     echo assign letter="W"
-    echo create partition primary size=2000
+    echo create partition primary size=!RECOVERY_SIZE!
     echo format quick fs=ntfs label="Recovery"
     echo assign letter="R"
     echo set id="de94bba4-06d1-4d40-a16a-bfd50179d6ac"
