@@ -414,8 +414,11 @@ This creates `B9450FA-OS.swm`, `B9450FA-OS2.swm`, etc. ApplyImage.bat automatica
 | 1 | System | 260MB | FAT32/EFI | UEFI boot files |
 | 2 | (MSR) | 16MB | Reserved | Microsoft Reserved |
 | 3 | Windows | * | NTFS | OS installation |
-| 4 | Recovery | 2GB | NTFS | WinRE (winre.wim) |
+| 4 | Recovery | Dynamic (see below) | NTFS | WinRE (winre.wim) |
 | 5 | MyASUS | * | NTFS | Vendor partition |
+
+> [!NOTE]
+> The Recovery partition size is computed dynamically. If a model-specific `ModelName-RECOVERY.wim` is present, ApplyImage.bat queries its expanded size via `dism /Get-WimInfo` and sizes the Recovery partition to that value plus a 500MB buffer; the Windows partition's `shrink minimum` is adjusted accordingly. If no `RECOVERY.wim` is found, it falls back to a 2500MB Recovery partition.
 
 # Log Files
 
