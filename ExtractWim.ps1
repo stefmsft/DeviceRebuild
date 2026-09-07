@@ -184,8 +184,12 @@ try {
     # ============================================================
     # Filter Pro and Pro Education editions
     # ============================================================
+    # Match on EditionId rather than ImageName: ImageName is localized
+    # (e.g. "Windows 11 Professionnel" on French ISOs), while EditionId
+    # ("Professional" / "ProfessionalEducation") is language-independent.
     $toExport = $allImages | Where-Object {
-        $_.ImageName -match '\bPro$' -or $_.ImageName -match '\bPro Education$'
+        $editionId = (Get-WindowsImage -ImagePath $sourceWim -Index $_.ImageIndex -ErrorAction Stop).EditionId
+        $editionId -in @('Professional', 'ProfessionalEducation')
     }
 
     if ($toExport.Count -eq 0) {
